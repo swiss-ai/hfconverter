@@ -24,3 +24,14 @@ sbatch convert.sbatch /capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megat
 ```bash
 sbatch convert.sbatch /iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-8b-128-nodes/checkpoints/ 1678000 /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus8B-it1678000
 ```
+
+### NCCL error on large models
+
+If you are converting large models (for example 70B) and encountered NCCL errors, there is an option in `convert.sbatch` to disable the AWS OFI NCCL hook, which might resolves the error. Use the environment variable `AWS_OFF=1` to disable the AWS hook. This makes the script use `envs/env_aws_off.toml`.
+
+Examples:
+
+```bash
+export AWS_OFF=1
+sbatch convert.sbatch <ckpt-path> <iteration> <output-path>
+```

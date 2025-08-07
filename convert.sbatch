@@ -33,6 +33,13 @@ TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
 MODEL=$1
 IT=$2
 OUT_PATH=$3
+AWS_OFF=${AWS_OFF:-0}
+
+if [ "$AWS_OFF" -eq 0 ]; then
+    ENV_FILE="env.toml"
+else
+    ENV_FILE="env_aws_off.toml"
+fi
 
 # Setup temporary paths.
 TEMP_PATH_ROOT=$SCRATCH/.tmp
@@ -45,7 +52,7 @@ trap cleanup EXIT
 MEGATRON_PATH="/workspace/Megatron-LM"
 
 echo "Running torchdist->torch"
-srun -ul --environment=./env.toml bash -c " \
+srun -ul --environment=./envs/$ENV_FILE bash -c " \
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
     export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -59,7 +66,7 @@ srun -ul --environment=./env.toml bash -c " \
 "
 
 echo "Running torch->hf"
-srun -ul --environment=./env.toml bash -c " \
+srun -ul --environment=./envs/$ENV_FILE bash -c " \
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
     python tools/checkpoint/convert.py \

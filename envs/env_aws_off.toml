@@ -1,0 +1,8 @@
+image = "/capstor/store/cscs/swissai/infra01/container-images/hfconverter-cuda.sqsh"
+
+mounts = ["/capstor", "/iopsstor", "/users"]
+workdir = "/workspace"
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "false"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
