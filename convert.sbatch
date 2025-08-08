@@ -34,6 +34,9 @@ MODEL=$1
 IT=$2
 OUT_PATH=$3
 
+# make sure the output path exists
+mkdir -p $OUT_PATH
+
 # Setup temporary paths.
 TEMP_PATH_ROOT=$SCRATCH/.tmp
 TORCH_NODIST_PATH=$(mktemp -d -p $TEMP_PATH_ROOT)
