@@ -67,9 +67,13 @@ srun -ul --environment=./env.toml bash -c " \
         --ckpt-step=$IT \
         --ckpt-convert-save=$TORCH_NODIST_PATH \
         --pipeline-model-parallel-size=\${MP}
-    unset CUDA_DEVICE_MAX_CONNECTIONS
-    unset MP
+"
+
+srun -ul --environment=./env.toml bash -c " \
+    $INSTALL_CMD
     echo 'Running torch->hf'
+    cd ${MEGATRON_PATH}
+    export PYTHONPATH=${MEGATRON_PATH}
     python tools/checkpoint/convert.py \
         --model-type=GPT \
         --loader=core \
