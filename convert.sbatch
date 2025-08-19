@@ -6,7 +6,7 @@
 #SBATCH --output=logs/%x_%j.log  # control where the stdout will be
 #SBATCH --error=logs/%x_%j.err   # control where the error messages will be
 #SBATCH --partition=normal       # partition name
-
+#SBATCH --time=02:00:00
 
 # Aux functions.
 usage() {
@@ -33,7 +33,7 @@ TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
 MODEL=$1
 IT=$2
 OUT_PATH=$3
-
+TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-""}
 # make sure the output path exists
 mkdir -p $OUT_PATH
 
@@ -47,8 +47,16 @@ trap cleanup EXIT
 
 MEGATRON_PATH="/workspace/Megatron-LM"
 
-echo "Running torchdist->torch"
+if [[ $TRANSFORMERS_BRANCH != "" ]]; then
+    INSTALL_CMD="pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
+        \"transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}\""
+else
+    INSTALL_CMD=""
+fi
+echo "Installation command: $INSTALL_CMD"
 srun -ul --environment=./env.toml bash -c " \
+    $INSTALL_CMD
+    echo 'Running torchdist->torch'
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
     export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -59,12 +67,9 @@ srun -ul --environment=./env.toml bash -c " \
         --ckpt-step=$IT \
         --ckpt-convert-save=$TORCH_NODIST_PATH \
         --pipeline-model-parallel-size=\${MP}
-"
-
-echo "Running torch->hf"
-srun -ul --environment=./env.toml bash -c " \
-    cd ${MEGATRON_PATH}
-    export PYTHONPATH=${MEGATRON_PATH}
+    unset CUDA_DEVICE_MAX_CONNECTIONS
+    unset MP
+    echo 'Running torch->hf'
     python tools/checkpoint/convert.py \
         --model-type=GPT \
         --loader=core \
