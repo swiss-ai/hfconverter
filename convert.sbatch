@@ -6,7 +6,6 @@
 #SBATCH --output=logs/%x_%j.log  # control where the stdout will be
 #SBATCH --error=logs/%x_%j.err   # control where the error messages will be
 #SBATCH --partition=normal       # partition name
-#SBATCH --time=02:00:00
 
 # Aux functions.
 usage() {
