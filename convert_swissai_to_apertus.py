@@ -27,7 +27,7 @@ def check_model_type(model_path):
     if config_path.exists():
         with open(config_path, 'r') as f:
             config = json.load(f)
-        return config.get('model_type', 'unknown'), config.get('dtype', 'float32')
+        return config.get('model_type', 'unknown'), config.get('dtype', 'float32') if 'dtype' in config else config.get('torch_dtype', 'float32')
     return 'unknown', 'float32'
 
 
