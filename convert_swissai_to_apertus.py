@@ -12,9 +12,13 @@ from pathlib import Path
 import shutil
 
 from transformers import AutoTokenizer, SwissAIConfig, SwissAIForCausalLM, ApertusConfig, ApertusForCausalLM
+from transformers.modeling_utils import no_init_weights
 
 PAD_TOKEN_ID = 3
-EOS_TOKEN_ID = 2
+EOS_TOKEN_ID = {
+    "default": 2,
+    "instruct": 68
+}
 BOS_TOKEN_ID = 1
 ROPE_THETA = {
     "base": 500000,
@@ -48,7 +52,7 @@ def convert_config(swissai_config: SwissAIConfig) -> ApertusConfig:
     return apertus_config
 
 
-def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False):
+def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False, is_instruct: bool = False):
     """
     Convert a SwissAI model to an Apertus model.
     
@@ -112,9 +116,11 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
             )
         
         print("Creating ApertusForCausalLM model...")
-        apertus_model = ApertusForCausalLM(apertus_config)
-                        
-        print("Copying model weights...")
+        
+        with no_init_weights():
+            apertus_model = ApertusForCausalLM(apertus_config)
+        
+        print("Preparing model weights...")
         swissai_state_dict = swissai_model.state_dict()
         
         if torch_dtype == torch.bfloat16:
@@ -167,7 +173,7 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
             saved_config = json.load(f)
         print(f"Saved model dtype: {saved_config.get('torch_dtype', 'not specified')}")
         saved_config["pad_token_id"] = PAD_TOKEN_ID
-        saved_config["eos_token_id"] = EOS_TOKEN_ID
+        saved_config["eos_token_id"] = EOS_TOKEN_ID['instruct' if is_instruct else 'default']
         saved_config["bos_token_id"] = BOS_TOKEN_ID
 
         if is_base:
@@ -181,8 +187,10 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
             saved_config["model_type"] = "apertus"
             if "architectures" in saved_config:
                 saved_config["architectures"] = [arch.replace("SwissAI", "Apertus") for arch in saved_config["architectures"]]
-            with open(config_path, 'w') as f:
-                json.dump(saved_config, f, indent=2)
+        with open(config_path, 'w') as f:
+            json.dump(saved_config, f, indent=2)
+    else:
+        raise ValueError(f"Config file not found at {config_path}")
     
     print("Conversion completed successfully!")
 
@@ -243,6 +251,12 @@ Examples:
         action="store_true",
         help="Whether the model is the base model"
     )
+
+    parser.add_argument(
+        "--is-instruct",
+        action="store_true",
+        help="Whether the model is an instruct model"
+    )
     
     args = parser.parse_args()
     
@@ -252,7 +266,8 @@ Examples:
             args.apertus_output_path,
             args.force,
             args.path_to_tokenizer,
-            args.is_base
+            args.is_base,
+            args.is_instruct
         )
     except Exception as e:
         print(f"Error during conversion: {e}")

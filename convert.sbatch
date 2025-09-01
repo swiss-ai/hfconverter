@@ -39,13 +39,13 @@ PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfcon
 # make sure the output path exists
 mkdir -p $OUT_PATH
 
-# Setup temporary paths.
-MEGATRON_TEMP_PATH_ROOT=$SCRATCH/.megatron_tmp
+MEGATRON_TEMP_PATH_ROOT=$SCRATCH/.megatron_tmp/.megatron_tmp_$SLURM_JOB_ID
 mkdir -p $MEGATRON_TEMP_PATH_ROOT
 TEMP_PATH_ROOT=$SCRATCH/.tmp
 TORCH_NODIST_PATH=$(mktemp -d -p $TEMP_PATH_ROOT)
 function cleanup {
         rm -rf $TORCH_NODIST_PATH
+        rm -rf $MEGATRON_TEMP_PATH_ROOT
 }
 trap cleanup EXIT
 

@@ -31,7 +31,8 @@ PATH_TO_TOKENIZER=${3:-/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/
 IS_BASE=${IS_BASE:-0}
 PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfconverter}
 TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"swissai-apertus-convert"}
-FORCE=${FORCE:-0}
+FORCE=${FORCE:-1}
+IS_INSTRUCT=${IS_INSTRUCT:-1}
 
 if [ "$PATH_TO_TOKENIZER" != "None" ]; then
     COMMAND="python convert_swissai_to_apertus.py \"$SWISSAI_MODEL_PATH\" \"$APERTUS_OUTPUT_PATH\" --path-to-tokenizer \"$PATH_TO_TOKENIZER\""
@@ -45,6 +46,10 @@ fi
 
 if [ "$FORCE" == "1" ]; then
     COMMAND="$COMMAND --force"
+fi
+
+if [ "$IS_INSTRUCT" == "1" ]; then
+    COMMAND="$COMMAND --is-instruct"
 fi
 
 echo "Command to run: $COMMAND"
