@@ -32,23 +32,40 @@ TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
 MODEL=$1
 IT=$2
 OUT_PATH=$3
-TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-""}
+TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"model/apertus"}
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-"xielu-beta-eps-fix"}
+PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfconverter}
+
 # make sure the output path exists
 mkdir -p $OUT_PATH
 
-# Setup temporary paths.
+MEGATRON_TEMP_PATH_ROOT=$SCRATCH/.megatron_tmp/.megatron_tmp_$SLURM_JOB_ID
+mkdir -p $MEGATRON_TEMP_PATH_ROOT
 TEMP_PATH_ROOT=$SCRATCH/.tmp
 TORCH_NODIST_PATH=$(mktemp -d -p $TEMP_PATH_ROOT)
 function cleanup {
         rm -rf $TORCH_NODIST_PATH
+        rm -rf $MEGATRON_TEMP_PATH_ROOT
 }
 trap cleanup EXIT
 
-MEGATRON_PATH="/workspace/Megatron-LM"
+cd $PATH_TO_HFCONVERTER
+
+if [[ $MEGATRON_BRANCH == "" ]]; then
+    MEGATRON_PATH="/workspace/Megatron-LM"
+else
+    cd $MEGATRON_TEMP_PATH_ROOT
+    git clone https://github.com/swiss-ai/Megatron-LM.git
+    cd Megatron-LM
+    git checkout $MEGATRON_BRANCH
+    cd $PATH_TO_HFCONVERTER
+    MEGATRON_PATH=$MEGATRON_TEMP_PATH_ROOT/Megatron-LM
+fi
 
 if [[ $TRANSFORMERS_BRANCH != "" ]]; then
     INSTALL_CMD="pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
-        \"transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}\""
+        \"transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}\" \
+        && pip install -v --no-cache-dir -U 'huggingface-hub>=0.34.0,<1.0'"
 else
     INSTALL_CMD=""
 fi
