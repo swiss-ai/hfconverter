@@ -27,12 +27,18 @@ fi
 
 SWISSAI_MODEL_PATH=$1
 APERTUS_OUTPUT_PATH=$2
+
+# SFT and instruction-tuned models
 PATH_TO_TOKENIZER=${3:-/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer}
+
+# # base models
+# PATH_TO_TOKENIZER=${3:-/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer-base}
+
 IS_BASE=${IS_BASE:-0}
 PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfconverter}
 TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"swissai-apertus-convert"}
 FORCE=${FORCE:-1}
-IS_INSTRUCT=${IS_INSTRUCT:-1}
+IS_LONG_CONTEXT=${IS_LONG_CONTEXT:-1}
 
 if [ "$PATH_TO_TOKENIZER" != "None" ]; then
     COMMAND="python convert_swissai_to_apertus.py \"$SWISSAI_MODEL_PATH\" \"$APERTUS_OUTPUT_PATH\" --path-to-tokenizer \"$PATH_TO_TOKENIZER\""
@@ -48,8 +54,8 @@ if [ "$FORCE" == "1" ]; then
     COMMAND="$COMMAND --force"
 fi
 
-if [ "$IS_INSTRUCT" == "1" ]; then
-    COMMAND="$COMMAND --is-instruct"
+if [ "$IS_LONG_CONTEXT" == "1" ]; then
+    COMMAND="$COMMAND --is-long-context"
 fi
 
 echo "Command to run: $COMMAND"

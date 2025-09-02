@@ -16,13 +16,13 @@ from transformers.modeling_utils import no_init_weights
 
 PAD_TOKEN_ID = 3
 EOS_TOKEN_ID = {
-    "default": 2,
+    "base": 2,
     "instruct": 68
 }
 BOS_TOKEN_ID = 1
 ROPE_THETA = {
-    "base": 500000,
-    "post-train": 12000000
+    "pretrain": 500000,
+    "long-context": 12000000
 }
 
 def check_model_type(model_path):
@@ -52,7 +52,7 @@ def convert_config(swissai_config: SwissAIConfig) -> ApertusConfig:
     return apertus_config
 
 
-def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False, is_instruct: bool = False):
+def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False, is_long_context: bool = False):
     """
     Convert a SwissAI model to an Apertus model.
     
@@ -62,6 +62,7 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
         force_convert: Force conversion even if the model is already the target type
         path_to_tokenizer: Path to the tokenizer and chat template
         is_base: Whether the model is the base model
+        is_long_context: Whether the model is a long-context model
     """
     print(f"Loading model from: {swissai_model_path}")
     
@@ -173,15 +174,23 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
             saved_config = json.load(f)
         print(f"Saved model dtype: {saved_config.get('torch_dtype', 'not specified')}")
         saved_config["pad_token_id"] = PAD_TOKEN_ID
-        saved_config["eos_token_id"] = EOS_TOKEN_ID['instruct' if is_instruct else 'default']
         saved_config["bos_token_id"] = BOS_TOKEN_ID
 
         if is_base:
-            saved_config["rope_theta"] = ROPE_THETA["base"]
+            saved_config["eos_token_id"] = EOS_TOKEN_ID["base"]
             if os.path.exists(os.path.join(apertus_output_path, "chat_template.jinja")):
                 os.remove(os.path.join(apertus_output_path, "chat_template.jinja"))
         else:
-            saved_config["rope_theta"] = ROPE_THETA["post-train"]
+            saved_config["eos_token_id"] = EOS_TOKEN_ID["instruct"]
+
+        if is_long_context:
+            saved_config["rope_theta"] = ROPE_THETA["long-context"]
+            # make sure to use 64k as max position embeddings
+            assert saved_config["max_position_embeddings"] > 4096, "Max position embeddings must be more than 4096 for long-context models"
+        else:
+            saved_config["rope_theta"] = ROPE_THETA["pretrain"]
+            # make sure to use 4096 as max position embeddings
+            assert saved_config["max_position_embeddings"] == 4096, "Max position embeddings must be 4096 for pretrain models"
 
         if saved_config.get("model_type") != "apertus":
             saved_config["model_type"] = "apertus"
@@ -253,9 +262,9 @@ Examples:
     )
 
     parser.add_argument(
-        "--is-instruct",
+        "--is-long-context",
         action="store_true",
-        help="Whether the model is an instruct model"
+        help="Whether the model is a long-context model"
     )
     
     args = parser.parse_args()
@@ -267,7 +276,7 @@ Examples:
             args.force,
             args.path_to_tokenizer,
             args.is_base,
-            args.is_instruct
+            args.is_long_context
         )
     except Exception as e:
         print(f"Error during conversion: {e}")

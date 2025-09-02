@@ -39,13 +39,13 @@ To update an old checkpoint with a deprecated model name, use the following comm
 sbatch convert_swissai_to_apertus.sbatch <swissai-model-path> <apertus-output-path>
 ```
 
-Make sure `PATH_TO_TOKENIZER`, `IS_BASE`, `PATH_TO_HFCONVERTER`, `TRANSFORMERS_BRANCH`, `IS_INSTRUCT` and `FORCE` are set correctly in `convert_swissai_to_apertus.sbatch`.
+Make sure `PATH_TO_TOKENIZER`, `IS_BASE`, `PATH_TO_HFCONVERTER`, `TRANSFORMERS_BRANCH`, `IS_LONG_CONTEXT` and `FORCE` are set correctly in `convert_swissai_to_apertus.sbatch`.
 
 `PATH_TO_TOKENIZER` is the path to the correct tokenizer configs and chat template. It is not provided; the existing tokenizer in the old checkpoint path will be used.
 
-Set `IS_BASE=1` for base models; use `IS_BASE=0` for long-context models or post-train checkpoints.
+Set `IS_BASE=1` for base models; use `IS_BASE=0` for SFT and/or tuned checkpoints.
 
-`IS_INSTRUCT=1` is used whenever the model is instruction-tuned, otherwise `IS_INSTRUCT=0`.
+`IS_LONG_CONTEXT=1` is used whenever the model is long-context, otherwise `IS_LONG_CONTEXT=0`.
 
 `FORCE=1` force-updates the model even if it is previously update to Apertus to make sure consistency, otherwise `FORCE=0` and the conversion will be skipped for already converted checkpoints.
 
