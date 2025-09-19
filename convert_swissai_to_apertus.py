@@ -52,7 +52,7 @@ def convert_config(swissai_config: SwissAIConfig) -> ApertusConfig:
     return apertus_config
 
 
-def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False, is_long_context: bool = False):
+def convert_model(swissai_model_path: str, apertus_output_path: str, force_convert: bool = False, path_to_tokenizer: str = None, is_base: bool = False, is_long_context: bool = False, skip_weights: bool = False):
     """
     Convert a SwissAI model to an Apertus model.
     
@@ -63,6 +63,7 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
         path_to_tokenizer: Path to the tokenizer and chat template
         is_base: Whether the model is the base model
         is_long_context: Whether the model is a long-context model
+        skip_weights: Skip weight conversion and only update configs
     """
     print(f"Loading model from: {swissai_model_path}")
     
@@ -73,13 +74,15 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
     torch_dtype = torch.bfloat16 if original_dtype == "bfloat16" else torch.float32
     print(f"Using torch dtype: {torch_dtype}")
     
-    if actual_model_type == "apertus" and not force_convert:
+    if skip_weights:
+        print(f"Skipping weight conversion, only updating configs with dtype {original_dtype}...")
+        original_dtype = original_dtype  # Keep the original dtype
+    elif actual_model_type == "apertus" and not force_convert:
         print("Warning: This appears to already be an Apertus model!")
         print("Skipping conversion...")
         return
         
-    else:
-
+    if not skip_weights:
         try:
             swissai_config = SwissAIConfig.from_pretrained(swissai_model_path)
         except Exception as e:
@@ -154,6 +157,15 @@ def convert_model(swissai_model_path: str, apertus_output_path: str, force_conve
         apertus_model.config.torch_dtype = original_dtype
         
         apertus_model.save_pretrained(apertus_output_path)
+    else:
+        # When skip_weights is True, copy the model if source and output paths are different
+        if os.path.abspath(swissai_model_path) != os.path.abspath(apertus_output_path):
+            print(f"Copying model from {swissai_model_path} to {apertus_output_path}")
+            if os.path.exists(apertus_output_path):
+                shutil.rmtree(apertus_output_path)
+            shutil.copytree(swissai_model_path, apertus_output_path)
+        else:
+            print("Source and output paths are the same, updating configs in place")
     
     try:
         if path_to_tokenizer:
@@ -267,6 +279,12 @@ Examples:
         help="Whether the model is a long-context model"
     )
     
+    parser.add_argument(
+        "--skip-weights",
+        action="store_true",
+        help="Skip weight conversion and only update configs"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -276,7 +294,8 @@ Examples:
             args.force,
             args.path_to_tokenizer,
             args.is_base,
-            args.is_long_context
+            args.is_long_context,
+            args.skip_weights
         )
     except Exception as e:
         print(f"Error during conversion: {e}")

@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=logs/%x_%j.log  # control where the stdout will be
 #SBATCH --error=logs/%x_%j.err   # control where the error messages will be
-#SBATCH --partition=normal       # partition name
+#SBATCH --partition=debug       # partition name
 
 # Aux functions.
 usage() {
@@ -32,9 +32,17 @@ TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
 MODEL=$1
 IT=$2
 OUT_PATH=$3
-TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"model/apertus"}
+TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"swissai-apertus-convert"}
 MEGATRON_BRANCH=${MEGATRON_BRANCH:-"xielu-beta-eps-fix"}
 PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfconverter}
+IS_BASE=${IS_BASE:-0}
+IS_LONG_CONTEXT=${IS_LONG_CONTEXT:-1}
+
+# SFT and instruction-tuned models
+PATH_TO_TOKENIZER=${4:-/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer}
+
+# # base models
+# PATH_TO_TOKENIZER=${4:-/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer-base}
 
 # make sure the output path exists
 mkdir -p $OUT_PATH
@@ -98,6 +106,30 @@ srun -ul --environment=./env.toml bash -c " \
         --save-dir=$OUT_PATH \
         --hf-tokenizer=$TOKENIZER
 "
+
+# Update configs to Apertus format
+echo "Updating configs to Apertus format..."
+COMMAND="python $PATH_TO_HFCONVERTER/convert_swissai_to_apertus.py \"$OUT_PATH\" \"$OUT_PATH\" --skip-weights --force"
+
+if [ "$PATH_TO_TOKENIZER" != "None" ]; then
+    COMMAND="$COMMAND --path-to-tokenizer \"$PATH_TO_TOKENIZER\""
+fi
+
+if [ "$IS_BASE" == "1" ]; then
+    COMMAND="$COMMAND --is-base"
+fi
+
+if [ "$IS_LONG_CONTEXT" == "1" ]; then
+    COMMAND="$COMMAND --is-long-context"
+fi
+
+echo "Running config update command: $COMMAND"
+
+srun -ul --environment=./env.toml bash -c " \
+    $INSTALL_CMD
+    $COMMAND
+"
+
 # Goodbye.
 echo "Goodbye."
 echo "END TIME: $(date)"

@@ -17,6 +17,13 @@ sbatch convert.sbatch <ckpt-path> <iteration> <output-path>
 
 Make sure that `TRANSFORMERS_BRANCH` and `MEGATRON_BRANCH` are set correctly in `convert.sbatch`.
 
+Environment variables for `convert.sbatch`:
+- `TRANSFORMERS_BRANCH`: Branch of transformers to use (default: "swissai-apertus-convert")
+- `MEGATRON_BRANCH`: Branch of Megatron-LM to use (default: "xielu-beta-eps-fix")
+- `IS_BASE`: Set to 1 for base models, 0 for SFT/tuned models (default: 0)
+- `IS_LONG_CONTEXT`: Set to 1 for long-context models (default: 0)
+- `PATH_TO_TOKENIZER`: Path to tokenizer configs (default: /capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer)
+
 70B Model Convert Example:
 
 ```bash
@@ -29,7 +36,16 @@ sbatch convert.sbatch /capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megat
 sbatch convert.sbatch /iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-8b-128-nodes/checkpoints/ 1678000 /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus8B-it1678000
 ```
 
-If your tokenizer is outdated or you want to make sure you are using the updated tokenizer and chat template, please follow [SwissAI-->-Apertus] and use your converted HF checkpoint as `<swissai-model-path>` with `FORCE=1`. Note that `<swissai-model-path>` and `<apertus-output-path>` should be different.
+Example with long-context base model:
+
+```bash
+export IS_BASE=1
+export IS_LONG_CONTEXT=1
+export PATH_TO_TOKENIZER=/capstor/store/cscs/swissai/infra01/pretrain-checkpoints/tokenizer-base
+sbatch convert.sbatch /path/to/checkpoint/ 1000000 /path/to/output/
+```
+
+The `convert.sbatch` script automatically updates the model configuration to Apertus format, including tokenizer and chat template, after the conversion is complete.
 
 ### SwissAI -> Apertus
 
