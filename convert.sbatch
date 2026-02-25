@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=a-infra01-1
+#SBATCH --account=infra01
 #SBATCH --job-name=convert
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -14,8 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Important knobs (override via env).
 DEBUG=${DEBUG:-0}
 
-TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
-TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-model/apertus}
+TOKENIZER=${TOKENIZER:-/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok}
 
 MEGATRON_REPO=${MEGATRON_REPO:-https://github.com/swiss-ai/Megatron-LM.git}
 MEGATRON_BRANCH=${MEGATRON_BRANCH:-feat/multimodal-convert-fix}
@@ -114,10 +113,8 @@ else
 fi || pause_for_debug $?
 export PATH_TO_HFCONVERTER
 
-ENV_TOML="$PATH_TO_HFCONVERTER/env.toml"
-if [[ ! -f "$ENV_TOML" ]]; then
-    die "env.toml not found at $ENV_TOML"
-fi
+RUN_ENV=${RUN_ENV:-$PATH_TO_HFCONVERTER/nemo.toml}
+echo "Using srun --environment=$RUN_ENV"
 
 cd "$PATH_TO_HFCONVERTER"
 
@@ -137,16 +134,8 @@ else
     cd "$PATH_TO_HFCONVERTER"
 fi || pause_for_debug $?
 
-if [[ $TRANSFORMERS_BRANCH != "" ]]; then
-    INSTALL_CMD="pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
-        \"transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}\" \
-        && pip install -v --no-cache-dir -U 'huggingface-hub>=0.34.0,<1.0'"
-else
-    INSTALL_CMD=""
-fi
-echo "Installation command: $INSTALL_CMD"
-srun -ul --environment="$ENV_TOML" bash -c " \
-    $INSTALL_CMD
+echo "Dependency installation disabled; using environment as-is."
+srun -ul --environment="$RUN_ENV" bash -c " \
     echo 'Running torchdist->torch'
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
@@ -162,7 +151,7 @@ srun -ul --environment="$ENV_TOML" bash -c " \
 
 TORCH_SAVE_DIR="$TORCH_NODIST_PATH/torch"
 
-srun -ul --environment="$ENV_TOML" bash -c "set -eux
+srun -ul --environment="$RUN_ENV" bash -c "set -eux
   echo 'Stage1 output dir: $TORCH_SAVE_DIR'
   ls -lah '$TORCH_SAVE_DIR'
   echo 'Look for torch_dist artifacts (should be EMPTY for legacy torch):'
@@ -172,8 +161,7 @@ srun -ul --environment="$ENV_TOML" bash -c "set -eux
   find '$TORCH_SAVE_DIR' -maxdepth 4 -path '*/mp_rank_*/*model_optim_rng.pt' -print | head
 "
 
-srun -ul --environment="$ENV_TOML" bash -c " \
-    $INSTALL_CMD
+srun -ul --environment="$RUN_ENV" bash -c " \
     export CUDA_DEVICE_MAX_CONNECTIONS=1
     echo 'Running torch->hf'
     cd ${MEGATRON_PATH}
