@@ -9,6 +9,22 @@
 
 export TMPDIR="${SLURM_TMPDIR:-/iopsstor/scratch/cscs/$USER/.tmp}"
 mkdir -p "$TMPDIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Important knobs (override via env).
+DEBUG=${DEBUG:-0}
+
+TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
+TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-model/apertus}
+
+MEGATRON_REPO=${MEGATRON_REPO:-https://github.com/swiss-ai/Megatron-LM.git}
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-feat/multimodal-convert-fix}
+
+HFCONVERTER_REPO=${HFCONVERTER_REPO:-https://github.com/swiss-ai/hfconverter.git}
+HFCONVERTER_BRANCH=${HFCONVERTER_BRANCH:-feat/multimodal-converter}
+
+LOCAL_HFCONVERTER_PATH=${LOCAL_HFCONVERTER_PATH:-}
+LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-}
 
 # Aux functions.
 usage() {
@@ -19,9 +35,6 @@ die() {
         echo "$*" >& 2
         exit 1
 }
-
-# Keep tmp dirs if we pause for debugging
-DEBUG=${DEBUG:-0}
 
 pause_for_debug() {
     rc=$1
@@ -57,38 +70,56 @@ if (( $# != 3 )); then
         die "Invalid usage: Invalid argument count"
 fi
 
-TOKENIZER=${TOKENIZER:-alehc/swissai-tokenizer}
 MODEL=$1
 IT=$2
 OUT_PATH=$3
-TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"model/apertus"}
-MEGATRON_BRANCH=${MEGATRON_BRANCH:-"multimodality/main"}
-PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/${USER}/hfconverter}
 
 # make sure the output path exists
-mkdir -p $OUT_PATH
+mkdir -p "$OUT_PATH"
 
 MEGATRON_TEMP_PATH_ROOT=$SCRATCH/.megatron_tmp/.megatron_tmp_$SLURM_JOB_ID
-mkdir -p $MEGATRON_TEMP_PATH_ROOT
+HFCONVERTER_TEMP_PATH_ROOT=$SCRATCH/.hfconverter_tmp/.hfconverter_tmp_$SLURM_JOB_ID
+mkdir -p "$MEGATRON_TEMP_PATH_ROOT"
+mkdir -p "$HFCONVERTER_TEMP_PATH_ROOT"
 TEMP_PATH_ROOT=$SCRATCH/.tmp
-TORCH_NODIST_PATH=$(mktemp -d -p $TEMP_PATH_ROOT)
+TORCH_NODIST_PATH=$(mktemp -d -p "$TEMP_PATH_ROOT")
 function cleanup {
     if (( DEBUG == 0 )); then
         rm -rf "$TORCH_NODIST_PATH"
         rm -rf "$MEGATRON_TEMP_PATH_ROOT"
+        rm -rf "$HFCONVERTER_TEMP_PATH_ROOT"
     else
         echo "DEBUG=1 -> keeping temp dirs:"
         echo "  $TORCH_NODIST_PATH"
         echo "  $MEGATRON_TEMP_PATH_ROOT"
+        echo "  $HFCONVERTER_TEMP_PATH_ROOT"
     fi
 }
 trap cleanup EXIT
 trap cleanup EXIT
 
-cd $PATH_TO_HFCONVERTER
+if [[ -d "$LOCAL_HFCONVERTER_PATH/.git" ]]; then
+    PATH_TO_HFCONVERTER="$LOCAL_HFCONVERTER_PATH"
+    echo "Using local hfconverter: $PATH_TO_HFCONVERTER"
+    echo "  commit: $(git -C "$PATH_TO_HFCONVERTER" rev-parse HEAD)"
+else
+    echo "Local hfconverter not found at $LOCAL_HFCONVERTER_PATH; cloning into $HFCONVERTER_TEMP_PATH_ROOT"
+    git clone "$HFCONVERTER_REPO" "$HFCONVERTER_TEMP_PATH_ROOT/hfconverter"
+    if [[ -n "$HFCONVERTER_BRANCH" ]]; then
+        git -C "$HFCONVERTER_TEMP_PATH_ROOT/hfconverter" checkout "$HFCONVERTER_BRANCH"
+    fi
+    PATH_TO_HFCONVERTER="$HFCONVERTER_TEMP_PATH_ROOT/hfconverter"
+    echo "Using cloned hfconverter: $PATH_TO_HFCONVERTER"
+    echo "  commit: $(git -C "$PATH_TO_HFCONVERTER" rev-parse HEAD)"
+fi || pause_for_debug $?
+export PATH_TO_HFCONVERTER
 
-LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-/capstor/store/cscs/swissai/infra01/users/mboronski/src/Megatron-LM}
-MEGATRON_BRANCH=${MEGATRON_BRANCH:-multimodality/main}
+ENV_TOML="$PATH_TO_HFCONVERTER/env.toml"
+if [[ ! -f "$ENV_TOML" ]]; then
+    die "env.toml not found at $ENV_TOML"
+fi
+
+cd "$PATH_TO_HFCONVERTER"
 
 if [[ -d "$LOCAL_MEGATRON_PATH/.git" ]]; then
     MEGATRON_PATH="$LOCAL_MEGATRON_PATH"
@@ -97,7 +128,7 @@ if [[ -d "$LOCAL_MEGATRON_PATH/.git" ]]; then
 else
     echo "Local Megatron-LM not found at $LOCAL_MEGATRON_PATH; cloning into $MEGATRON_TEMP_PATH_ROOT"
     cd "$MEGATRON_TEMP_PATH_ROOT"
-    git clone https://github.com/swiss-ai/Megatron-LM.git
+    git clone "$MEGATRON_REPO"
     cd Megatron-LM
     git checkout "$MEGATRON_BRANCH"
     MEGATRON_PATH="$MEGATRON_TEMP_PATH_ROOT/Megatron-LM"
@@ -114,7 +145,7 @@ else
     INSTALL_CMD=""
 fi
 echo "Installation command: $INSTALL_CMD"
-srun -ul --environment=./env.toml bash -c " \
+srun -ul --environment="$ENV_TOML" bash -c " \
     $INSTALL_CMD
     echo 'Running torchdist->torch'
     cd ${MEGATRON_PATH}
@@ -131,7 +162,7 @@ srun -ul --environment=./env.toml bash -c " \
 
 TORCH_SAVE_DIR="$TORCH_NODIST_PATH/torch"
 
-srun -ul --environment=./env.toml bash -c "set -eux
+srun -ul --environment="$ENV_TOML" bash -c "set -eux
   echo 'Stage1 output dir: $TORCH_SAVE_DIR'
   ls -lah '$TORCH_SAVE_DIR'
   echo 'Look for torch_dist artifacts (should be EMPTY for legacy torch):'
@@ -141,7 +172,7 @@ srun -ul --environment=./env.toml bash -c "set -eux
   find '$TORCH_SAVE_DIR' -maxdepth 4 -path '*/mp_rank_*/*model_optim_rng.pt' -print | head
 "
 
-srun -ul --environment=./env.toml bash -c " \
+srun -ul --environment="$ENV_TOML" bash -c " \
     $INSTALL_CMD
     export CUDA_DEVICE_MAX_CONNECTIONS=1
     echo 'Running torch->hf'
