@@ -7,6 +7,9 @@
 #SBATCH --error=logs/%x_%j.err   # control where the error messages will be
 #SBATCH --partition=normal       # partition name
 
+export TMPDIR="${SLURM_TMPDIR:-/iopsstor/scratch/cscs/$USER/.tmp}"
+mkdir -p "$TMPDIR"
+
 # Aux functions.
 usage() {
         echo "Usage: sbatch convert.sbatch <ckpt-path> <iteration> <output-path>"
@@ -15,6 +18,32 @@ usage() {
 die() {
         echo "$*" >& 2
         exit 1
+}
+
+# Keep tmp dirs if we pause for debugging
+DEBUG=${DEBUG:-0}
+
+pause_for_debug() {
+    rc=$1
+    if (( DEBUG != 1 )); then
+        return "$rc"
+    fi
+    echo ""
+    echo "=== FAILURE (rc=$rc) ==="
+    echo "Job $SLURM_JOB_ID on nodes: $SLURM_JOB_NODELIST"
+    echo "TORCH_NODIST_PATH=$TORCH_NODIST_PATH"
+    echo "MEGATRON_PATH=$MEGATRON_PATH"
+    echo ""
+    echo "To get an interactive shell in THIS allocation (new terminal):"
+    echo "  srun --jobid=$SLURM_JOB_ID --pty --environment=$PATH_TO_HFCONVERTER/env.toml bash -l"
+    echo ""
+    echo "When done, cancel the job:"
+    echo "  scancel $SLURM_JOB_ID"
+    echo "========================"
+    echo ""
+    DEBUG=1
+    export DEBUG
+    sleep infinity
 }
 
 # Wake up.
@@ -33,8 +62,8 @@ MODEL=$1
 IT=$2
 OUT_PATH=$3
 TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH:-"model/apertus"}
-MEGATRON_BRANCH=${MEGATRON_BRANCH:-"xielu-beta-eps-fix"}
-PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/ansaripo/hfconverter}
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-"multimodality/main"}
+PATH_TO_HFCONVERTER=${PATH_TO_HFCONVERTER:-/iopsstor/scratch/cscs/${USER}/hfconverter}
 
 # make sure the output path exists
 mkdir -p $OUT_PATH
@@ -44,23 +73,38 @@ mkdir -p $MEGATRON_TEMP_PATH_ROOT
 TEMP_PATH_ROOT=$SCRATCH/.tmp
 TORCH_NODIST_PATH=$(mktemp -d -p $TEMP_PATH_ROOT)
 function cleanup {
-        rm -rf $TORCH_NODIST_PATH
-        rm -rf $MEGATRON_TEMP_PATH_ROOT
+    if (( DEBUG == 0 )); then
+        rm -rf "$TORCH_NODIST_PATH"
+        rm -rf "$MEGATRON_TEMP_PATH_ROOT"
+    else
+        echo "DEBUG=1 -> keeping temp dirs:"
+        echo "  $TORCH_NODIST_PATH"
+        echo "  $MEGATRON_TEMP_PATH_ROOT"
+    fi
 }
+trap cleanup EXIT
 trap cleanup EXIT
 
 cd $PATH_TO_HFCONVERTER
 
-if [[ $MEGATRON_BRANCH == "" ]]; then
-    MEGATRON_PATH="/workspace/Megatron-LM"
+LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-/capstor/store/cscs/swissai/infra01/users/mboronski/src/Megatron-LM}
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-multimodality/main}
+
+if [[ -d "$LOCAL_MEGATRON_PATH/.git" ]]; then
+    MEGATRON_PATH="$LOCAL_MEGATRON_PATH"
+    echo "Using local Megatron-LM: $MEGATRON_PATH"
+    echo "  commit: $(git -C "$MEGATRON_PATH" rev-parse HEAD)"
 else
-    cd $MEGATRON_TEMP_PATH_ROOT
+    echo "Local Megatron-LM not found at $LOCAL_MEGATRON_PATH; cloning into $MEGATRON_TEMP_PATH_ROOT"
+    cd "$MEGATRON_TEMP_PATH_ROOT"
     git clone https://github.com/swiss-ai/Megatron-LM.git
     cd Megatron-LM
-    git checkout $MEGATRON_BRANCH
-    cd $PATH_TO_HFCONVERTER
-    MEGATRON_PATH=$MEGATRON_TEMP_PATH_ROOT/Megatron-LM
-fi
+    git checkout "$MEGATRON_BRANCH"
+    MEGATRON_PATH="$MEGATRON_TEMP_PATH_ROOT/Megatron-LM"
+    echo "Using cloned Megatron-LM: $MEGATRON_PATH"
+    echo "  commit: $(git -C "$MEGATRON_PATH" rev-parse HEAD)"
+    cd "$PATH_TO_HFCONVERTER"
+fi || pause_for_debug $?
 
 if [[ $TRANSFORMERS_BRANCH != "" ]]; then
     INSTALL_CMD="pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
@@ -76,17 +120,30 @@ srun -ul --environment=./env.toml bash -c " \
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
     export CUDA_DEVICE_MAX_CONNECTIONS=1
-    MP=4  # We always use model_parallel=4 to ensure we never run out of cuda memory.
-    torchrun --nproc-per-node=\${MP} scripts/conversion/torchdist_2_torch.py \
+    torchrun --nproc-per-node=2 scripts/conversion/torchdist_2_torch.py \
         --bf16 \
         --load=$MODEL \
         --ckpt-step=$IT \
         --ckpt-convert-save=$TORCH_NODIST_PATH \
-        --pipeline-model-parallel-size=\${MP}
+        --pipeline-model-parallel-size=1 \
+        --tensor-model-parallel-size=2
+" || pause_for_debug $?
+
+TORCH_SAVE_DIR="$TORCH_NODIST_PATH/torch"
+
+srun -ul --environment=./env.toml bash -c "set -eux
+  echo 'Stage1 output dir: $TORCH_SAVE_DIR'
+  ls -lah '$TORCH_SAVE_DIR'
+  echo 'Look for torch_dist artifacts (should be EMPTY for legacy torch):'
+  find '$TORCH_SAVE_DIR' -maxdepth 3 \\( -name '*.distcp' -o -name 'metadata.json' \\) -print || true
+
+  echo 'Look for legacy artifacts (should EXIST):'
+  find '$TORCH_SAVE_DIR' -maxdepth 4 -path '*/mp_rank_*/*model_optim_rng.pt' -print | head
 "
 
 srun -ul --environment=./env.toml bash -c " \
     $INSTALL_CMD
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
     echo 'Running torch->hf'
     cd ${MEGATRON_PATH}
     export PYTHONPATH=${MEGATRON_PATH}
@@ -97,7 +154,8 @@ srun -ul --environment=./env.toml bash -c " \
         --load-dir=$TORCH_NODIST_PATH/torch \
         --save-dir=$OUT_PATH \
         --hf-tokenizer=$TOKENIZER
-"
+" || pause_for_debug $?
+
 # Goodbye.
 echo "Goodbye."
 echo "END TIME: $(date)"

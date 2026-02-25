@@ -1,58 +1,30 @@
-# Checkpoint Converter to HuggingFace
+# Multimodal Checkpoint Converter to HuggingFace
 
-## 🚀 Installation
+This is a WIP multimodal converter that assumes many things (ie. TP, PP, World size etc).
 
-No additional installation steps are required.  
-All dependencies are bundled, simply run the `convert.sbatch` script.
+## Megatron -> HF
 
-## Usage
-
-### Megatron -> HF
-
-To convert a Megatron checkpoint to Hugging Face, use the following command:
-
-```bash
-sbatch convert.sbatch <ckpt-path> <iteration> <output-path>
+```
+sbatch convert.sbatch <dir path to megatron checkpoint> <checkpoint iteration> <dir to path to write to>
 ```
 
-Make sure that `TRANSFORMERS_BRANCH` and `MEGATRON_BRANCH` are set correctly in `convert.sbatch`.
+For example:
 
-70B Model Convert Example:
-
-```bash
-sbatch convert.sbatch /capstor/scratch/cscs/asolergi/main_run_70B_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-70b-512-nodes-1e-5lr/checkpoints-512-noOverlap/ 830000 /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus70B-it830000
+```
+sbatch ~/hfconverter/convert.sbatch /capstor/store/cscs/swissai/infra01/MLLM/apertus-8b/extended_model_vocab_266440 1 /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus-audio-ablations-base-extended-1
 ```
 
-8B Model Convert Example:
+## Compare logits
+
+Minimal script to compare logits between original Megatron checkpoint and converted HF checkpoint
 
 ```bash
-sbatch convert.sbatch /iopsstor/scratch/cscs/schlag/main_run_megatron/Megatron-LM/logs/Meg-Runs/main-runs-v1/apertus3-8b-128-nodes/checkpoints/ 1678000 /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus8B-it1678000
-```
+# 1) Generate native Megatron logits report
+sbatch logits_tools/get_native_dist_logits.sbatch <megatron_ckpt_dir> <iteration> "Sanity check prompt."
 
-If your tokenizer is outdated or you want to make sure you are using the updated tokenizer and chat template, please follow [SwissAI-->-Apertus] and use your converted HF checkpoint as `<swissai-model-path>` with `FORCE=1`. Note that `<swissai-model-path>` and `<apertus-output-path>` should be different.
+# 2) Generate converted HF logits report (use the same prompt)
+sbatch logits_tools/get_hf_logits.sbatch <hf_ckpt_dir> "Sanity check prompt."
 
-### SwissAI -> Apertus
-
-To update an old checkpoint with a deprecated model name, use the following command:
-
-```bash
-sbatch convert_swissai_to_apertus.sbatch <swissai-model-path> <apertus-output-path>
-```
-
-Make sure `PATH_TO_TOKENIZER`, `IS_BASE`, `PATH_TO_HFCONVERTER`, `TRANSFORMERS_BRANCH`, `IS_LONG_CONTEXT` and `FORCE` are set correctly in `convert_swissai_to_apertus.sbatch`.
-
-`PATH_TO_TOKENIZER` is the path to the correct tokenizer configs and chat template. It is not provided; the existing tokenizer in the old checkpoint path will be used.
-
-Set `IS_BASE=1` for base models; use `IS_BASE=0` for SFT and/or tuned checkpoints.
-
-`IS_LONG_CONTEXT=1` is used whenever the model is long-context, otherwise `IS_LONG_CONTEXT=0`.
-
-`FORCE=1` force-updates the model even if it is previously update to Apertus to make sure consistency, otherwise `FORCE=0` and the conversion will be skipped for already converted checkpoints.
-
-Example: 
-
-```bash
-export IS_BASE=0
-export IS_INSTRUCT=1
-sbatch /iopsstor/scratch/cscs/ansaripo/hfconverter/convert_swissai_to_apertus.sbatch /capstor/store/cscs/swissai/infra01/pretrain-checkpoints/apertus/Apertus8B-tokens15T-longcontext64k/ /iopsstor/scratch/cscs/ansaripo/hf_checkpoints/test-swissai-apertus
+# 3) Compare generated *.report.json files
+python logits_tools/compare_reports.py
 ```
