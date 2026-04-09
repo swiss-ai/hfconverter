@@ -1,10 +1,11 @@
-WORKDIR /workspace
 
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3
 ARG TRANSFORMERS_BRANCH=aimv2-fix
 ARG MEGATRON_BRANCH=main
 
 FROM ${BASE_IMAGE}
+
+WORKDIR /workspace
 
 # Install dependencies.
 RUN pip install --no-deps --no-build-isolation git+https://github.com/nickjbrowning/XIELU.git@main
