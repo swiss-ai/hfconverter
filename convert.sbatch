@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --account=infra01
+#SBATCH --reservation=SD-69241-apertus-1-5
 #SBATCH --job-name=convert
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -22,8 +23,8 @@ MEGATRON_BRANCH=${MEGATRON_BRANCH:-feat/multimodal-convert-fix}
 HFCONVERTER_REPO=${HFCONVERTER_REPO:-https://github.com/swiss-ai/hfconverter.git}
 HFCONVERTER_BRANCH=${HFCONVERTER_BRANCH:-feat/multimodal-converter}
 
-LOCAL_HFCONVERTER_PATH=${LOCAL_HFCONVERTER_PATH:-}
-LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-}
+LOCAL_HFCONVERTER_PATH=${LOCAL_HFCONVERTER_PATH:-$SLURM_SUBMIT_DIR}
+LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-$SLURM_SUBMIT_DIR/Megatron-LM}
 
 # Aux functions.
 usage() {
