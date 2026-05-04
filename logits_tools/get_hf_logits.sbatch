@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=a-infra01-1
+#SBATCH --account=infra01
 #SBATCH --job-name=hf-logits
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -24,11 +24,14 @@ usage() {
     echo ""
     echo "Optional env:"
     echo "  PATH_TO_HFCONVERTER=~/hfconverter"
+    echo "  RUN_ENV=~/hfconverter/nemo.toml       # same container env as convert.sbatch"
     echo "  HF_DTYPE=bf16                         # bf16|fp16|fp32|auto"
     echo "  HF_DEVICE=cuda                        # cuda|cpu"
+    echo "  HF_DEVICE_MAP=none                    # none|auto|balanced|sequential"
+    echo "  HF_MAX_MEMORY=                        # e.g. 0:90GiB,1:90GiB,2:90GiB,3:90GiB,cpu:200GiB"
     echo "  TRUST_REMOTE_CODE=1                   # pass --trust-remote-code"
     echo "  TRANSFORMERS_BRANCH=model/apertus     # swiss-ai transformers branch for apertus"
-    echo "  SKIP_TRANSFORMERS_INSTALL=0           # set 1 to skip pip install"
+    echo "  SKIP_TRANSFORMERS_INSTALL=1           # set 0 to force pip install"
 }
 
 if (( $# < 1 )); then
@@ -57,11 +60,11 @@ if (( $# >= 2 )); then
 fi
 
 if [[ -z "${PATH_TO_HFCONVERTER:-}" ]]; then
-    if [[ -f "${SUBMIT_DIR}/env.toml" ]]; then
+    if [[ -f "${SUBMIT_DIR}/nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="${SUBMIT_DIR}"
-    elif [[ -f "${SCRIPT_DIR}/../env.toml" ]]; then
+    elif [[ -f "${SCRIPT_DIR}/../nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="$(cd "${SCRIPT_DIR}/.." && pwd)"
-    elif [[ -f "${SCRIPT_DIR}/env.toml" ]]; then
+    elif [[ -f "${SCRIPT_DIR}/nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="$(cd "${SCRIPT_DIR}" && pwd)"
     else
         PATH_TO_HFCONVERTER="${HOME}/hfconverter"
@@ -83,26 +86,28 @@ if [[ -z "${OUT_PT}" ]]; then
     OUT_PT="${RESULTS_DIR}/hf_logits_${CKPT_BASENAME}.pt"
 fi
 
-ENV_TOML="${PATH_TO_HFCONVERTER}/env.toml"
+RUN_ENV="${RUN_ENV:-${PATH_TO_HFCONVERTER}/nemo.toml}"
 PY_SCRIPT="${TOOLS_DIR}/get_hf_logits.py"
 HF_DTYPE="${HF_DTYPE:-bf16}"
 HF_DEVICE="${HF_DEVICE:-cuda}"
+HF_DEVICE_MAP="${HF_DEVICE_MAP:-none}"
+HF_MAX_MEMORY="${HF_MAX_MEMORY:-}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 TRANSFORMERS_BRANCH="${TRANSFORMERS_BRANCH:-model/apertus}"
-SKIP_TRANSFORMERS_INSTALL="${SKIP_TRANSFORMERS_INSTALL:-0}"
+SKIP_TRANSFORMERS_INSTALL="${SKIP_TRANSFORMERS_INSTALL:-1}"
 
 mkdir -p "$(dirname "$OUT_PT")"
 mkdir -p logs
 
 if [[ ! -f "$PY_SCRIPT" ]]; then
     echo "ERROR: Python script not found: $PY_SCRIPT"
-    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with env.toml and logits_tools/)."
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/)."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
     exit 1
 fi
-if [[ ! -f "$ENV_TOML" ]]; then
-    echo "ERROR: env.toml not found: $ENV_TOML"
-    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with env.toml and logits_tools/)."
+if [[ ! -f "$RUN_ENV" ]]; then
+    echo "ERROR: RUN_ENV not found: $RUN_ENV"
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/), or set RUN_ENV explicitly."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
     exit 1
 fi
@@ -118,16 +123,19 @@ echo "OUT_REPORT=${OUT_REPORT:-<auto>}"
 echo "RESULTS_DIR=$RESULTS_DIR"
 echo "HF_DTYPE=$HF_DTYPE"
 echo "HF_DEVICE=$HF_DEVICE"
+echo "HF_DEVICE_MAP=$HF_DEVICE_MAP"
+echo "HF_MAX_MEMORY=${HF_MAX_MEMORY:-<none>}"
 echo "TRANSFORMERS_BRANCH=$TRANSFORMERS_BRANCH"
 echo "SKIP_TRANSFORMERS_INSTALL=$SKIP_TRANSFORMERS_INSTALL"
 echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
 echo "PATH_TO_HFCONVERTER=$PATH_TO_HFCONVERTER"
 echo "TOOLS_DIR=$TOOLS_DIR"
 echo "PY_SCRIPT=$PY_SCRIPT"
+echo "RUN_ENV=$RUN_ENV"
 
-export PY_SCRIPT HF_CKPT_DIR OUT_PT OUT_REPORT PROMPT HF_DTYPE HF_DEVICE TRUST_REMOTE_CODE
+export PY_SCRIPT HF_CKPT_DIR OUT_PT OUT_REPORT PROMPT HF_DTYPE HF_DEVICE HF_DEVICE_MAP HF_MAX_MEMORY TRUST_REMOTE_CODE
 export TRANSFORMERS_BRANCH SKIP_TRANSFORMERS_INSTALL
-srun -ul --environment="$ENV_TOML" bash -lc '
+srun -ul --environment="$RUN_ENV" bash -lc '
 set -euo pipefail
 if [[ "${SKIP_TRANSFORMERS_INSTALL}" != "1" && -n "${TRANSFORMERS_BRANCH}" ]]; then
   pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
@@ -141,7 +149,11 @@ cmd=(
   --out-pt "${OUT_PT}"
   --dtype "${HF_DTYPE}"
   --device "${HF_DEVICE}"
+  --device-map "${HF_DEVICE_MAP}"
 )
+if [[ -n "${HF_MAX_MEMORY}" ]]; then
+  cmd+=(--max-memory "${HF_MAX_MEMORY}")
+fi
 if [[ -n "${OUT_REPORT}" ]]; then
   cmd+=(--out-report "${OUT_REPORT}")
 fi

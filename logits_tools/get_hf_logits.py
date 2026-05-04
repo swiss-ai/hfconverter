@@ -3,7 +3,7 @@ import argparse
 import hashlib
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -28,6 +28,18 @@ def parse_args():
         default="cuda",
         choices=["cuda", "cpu"],
         help="Device for inference",
+    )
+    parser.add_argument(
+        "--device-map",
+        type=str,
+        default="none",
+        help="HF device_map value. Use 'auto' for multi-GPU sharded loading, or 'none' for a single device.",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=str,
+        default="",
+        help="Optional max_memory for device_map, e.g. '0:90GiB,1:90GiB,2:90GiB,3:90GiB,cpu:200GiB'.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -66,6 +78,28 @@ def resolve_dtype(dtype_name: str):
     if dtype_name == "fp32":
         return torch.float32
     return "auto"
+
+
+def parse_max_memory(spec: str):
+    if not spec:
+        return None
+    result = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"Invalid max-memory item {item!r}; expected KEY:VALUE")
+        key, value = item.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or not value:
+            raise ValueError(f"Invalid max-memory item {item!r}; expected KEY:VALUE")
+        if key.isdigit():
+            result[int(key)] = value
+        else:
+            result[key] = value
+    return result
 
 
 def _sha256(data: bytes) -> str:
@@ -112,30 +146,47 @@ def main():
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.hf_dir,
-        trust_remote_code=args.trust_remote_code,
-        torch_dtype=model_dtype,
-    ).eval()
-    model.to(args.device)
+    load_kwargs = {
+        "trust_remote_code": args.trust_remote_code,
+        "torch_dtype": model_dtype,
+    }
+    if args.device_map.lower() != "none":
+        load_kwargs["device_map"] = args.device_map
+        max_memory = parse_max_memory(args.max_memory)
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+        load_kwargs["low_cpu_mem_usage"] = True
+
+    model = AutoModelForCausalLM.from_pretrained(args.hf_dir, **load_kwargs).eval()
+    if args.device_map.lower() == "none":
+        model.to(args.device)
+
+    input_device = args.device
+    if args.device_map.lower() != "none":
+        input_device = model.get_input_embeddings().weight.device
 
     encoded = tokenizer(args.prompt, return_tensors="pt")
-    encoded = {k: v.to(args.device) for k, v in encoded.items()}
+    encoded = {k: v.to(input_device) for k, v in encoded.items()}
     token_ids = encoded["input_ids"][0].tolist()
     if len(token_ids) == 0:
         raise RuntimeError("Prompt tokenized to an empty sequence.")
 
     logits = model(**encoded).logits
     last_token_logits = logits[:, -1, :].float().cpu()
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     ckpt_name = os.path.basename(os.path.normpath(args.hf_dir)) or "hf"
     default_prefix = f"hf_logits_{ckpt_name}"
     out_pt, out_report = resolve_output_paths(args.out_pt, args.out_report, default_prefix)
     report = build_comparison_report(args.prompt, token_ids, last_token_logits)
     report["output_pt_path"] = out_pt
     report["output_report_path"] = out_report
+    report["hf_checkpoint_path"] = os.path.abspath(args.hf_dir)
     report["mode"] = "hf"
     report["timestamp_utc"] = timestamp
+    report["dtype"] = args.dtype
+    report["device"] = args.device
+    report["device_map"] = args.device_map
+    report["max_memory"] = args.max_memory
 
     out_dir = os.path.dirname(out_pt)
     if out_dir:
@@ -149,6 +200,7 @@ def main():
             "hf_dir": args.hf_dir,
             "dtype": args.dtype,
             "device": args.device,
+            "device_map": args.device_map,
             "comparison_report": report,
         },
         out_pt,
