@@ -1,4 +1,0 @@
-[submodule "Megatron-LM"]
-	path = Megatron-LM
-	url = https://github.com/swiss-ai/Megatron-LM.git
-	branch = feat/multimodal-convert-fix

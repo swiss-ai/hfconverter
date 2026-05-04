@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --account=a-infra01-1
+#SBATCH --account=infra01
 #SBATCH --job-name=native-logits
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -23,9 +23,29 @@ usage() {
     echo "Report is auto-saved next to .pt as <name>.report.json"
     echo ""
     echo "Optional env:"
-    echo "  NPROC=2                                # must match runtime TP*PP for this job"
-    echo "  PATH_TO_HFCONVERTER=~/hfconverter      # where env.toml lives"
+    echo "  NPROC_PER_NODE=2                       # torchrun workers per node"
+    echo "  NPROC=2                                # legacy alias for NPROC_PER_NODE"
+    echo "  EXPECTED_TOTAL_RANKS=                  # optional guard: SLURM_NNODES*NPROC_PER_NODE must match"
+    echo "  MASTER_PORT=29501"
+    echo "  DISTRIBUTED_TIMEOUT_MINUTES=60"
+    echo "  PATH_TO_HFCONVERTER=~/hfconverter      # where nemo.toml lives"
+    echo "  RUN_ENV=~/hfconverter/nemo.toml        # same container env as convert.sbatch"
     echo "  LOCAL_MEGATRON_PATH=/path/to/Megatron-LM"
+    echo "  MEGATRON_REPO=https://github.com/swiss-ai/Megatron-LM.git"
+    echo "  MEGATRON_BRANCH=multimodality/main"
+    echo "  TOKENIZER=/path/to/hf-tokenizer        # override checkpoint tokenizer_model"
+}
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+validate_torchrun_ranks() {
+    TOTAL_TORCHRUN_RANKS=$((SLURM_NNODES * NPROC_PER_NODE))
+    if [[ -n "${EXPECTED_TOTAL_RANKS:-}" && "$TOTAL_TORCHRUN_RANKS" != "$EXPECTED_TOTAL_RANKS" ]]; then
+        die "Expected $EXPECTED_TOTAL_RANKS total torchrun ranks, got SLURM_NNODES*NPROC_PER_NODE=$SLURM_NNODES*$NPROC_PER_NODE=$TOTAL_TORCHRUN_RANKS. Override NPROC_PER_NODE or resubmit with matching --nodes."
+    fi
 }
 
 if (( $# < 2 )); then
@@ -54,13 +74,17 @@ if (( $# >= 3 )); then
     fi
 fi
 
-NPROC="${NPROC:-2}"
+EXPECTED_TOTAL_RANKS="${EXPECTED_TOTAL_RANKS:-}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-${NPROC:-2}}"
+MASTER_PORT="${MASTER_PORT:-29501}"
+DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-60}"
+TOKENIZER="${TOKENIZER:-/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok}"
 if [[ -z "${PATH_TO_HFCONVERTER:-}" ]]; then
-    if [[ -f "${SUBMIT_DIR}/env.toml" ]]; then
+    if [[ -f "${SUBMIT_DIR}/nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="${SUBMIT_DIR}"
-    elif [[ -f "${SCRIPT_DIR}/../env.toml" ]]; then
+    elif [[ -f "${SCRIPT_DIR}/../nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="$(cd "${SCRIPT_DIR}/.." && pwd)"
-    elif [[ -f "${SCRIPT_DIR}/env.toml" ]]; then
+    elif [[ -f "${SCRIPT_DIR}/nemo.toml" ]]; then
         PATH_TO_HFCONVERTER="$(cd "${SCRIPT_DIR}" && pwd)"
     else
         PATH_TO_HFCONVERTER="${HOME}/hfconverter"
@@ -78,8 +102,18 @@ if [[ -z "${OUT_PT}" ]]; then
     OUT_PT="${RESULTS_DIR}/native_logits_iter$(printf '%07d' "${ITER}").pt"
 fi
 
-ENV_TOML="${PATH_TO_HFCONVERTER}/env.toml"
-MEGATRON_PATH="${LOCAL_MEGATRON_PATH:-/capstor/store/cscs/swissai/infra01/users/mboronski/src/Megatron-LM}"
+RUN_ENV="${RUN_ENV:-${PATH_TO_HFCONVERTER}/nemo.toml}"
+MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/swiss-ai/Megatron-LM.git}"
+MEGATRON_BRANCH="${MEGATRON_BRANCH:-multimodality/main}"
+LOCAL_MEGATRON_PATH="${LOCAL_MEGATRON_PATH:-${PATH_TO_HFCONVERTER}/Megatron-LM}"
+MEGATRON_TEMP_PATH_ROOT="${SCRATCH:-/iopsstor/scratch/cscs/${USER}}/.megatron_tmp/.logits_megatron_tmp_${SLURM_JOB_ID}"
+
+cleanup() {
+    if [[ "${DEBUG:-0}" != "1" && -n "${MEGATRON_TEMP_PATH_ROOT:-}" ]]; then
+        rm -rf "$MEGATRON_TEMP_PATH_ROOT"
+    fi
+}
+trap cleanup EXIT
 
 mkdir -p "$(dirname "$OUT_PT")"
 mkdir -p logs
@@ -103,13 +137,13 @@ fi
 PY_SCRIPT="${TOOLS_DIR}/get_native_dist_logits.py"
 if [[ ! -f "$PY_SCRIPT" ]]; then
     echo "ERROR: Python script not found: $PY_SCRIPT"
-    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with env.toml and logits_tools/)."
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/)."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
     exit 1
 fi
-if [[ ! -f "$ENV_TOML" ]]; then
-    echo "ERROR: env.toml not found: $ENV_TOML"
-    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with env.toml and logits_tools/)."
+if [[ ! -f "$RUN_ENV" ]]; then
+    echo "ERROR: RUN_ENV not found: $RUN_ENV"
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/), or set RUN_ENV explicitly."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
     exit 1
 fi
@@ -121,27 +155,68 @@ echo "ITER_DIR=$ITER_DIR"
 echo "OUT_PT=$OUT_PT"
 echo "OUT_REPORT=${OUT_REPORT:-<auto>}"
 echo "RESULTS_DIR=$RESULTS_DIR"
-echo "NPROC=$NPROC"
+MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
+export MASTER_ADDR MASTER_PORT
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "SLURM_NNODES=$SLURM_NNODES"
+validate_torchrun_ranks
+echo "NPROC_PER_NODE=$NPROC_PER_NODE"
+echo "TOTAL_TORCHRUN_RANKS=$TOTAL_TORCHRUN_RANKS"
+echo "DISTRIBUTED_TIMEOUT_MINUTES=$DISTRIBUTED_TIMEOUT_MINUTES"
+echo "TOKENIZER=$TOKENIZER"
 echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
 echo "PATH_TO_HFCONVERTER=$PATH_TO_HFCONVERTER"
 echo "TOOLS_DIR=$TOOLS_DIR"
 echo "PY_SCRIPT=$PY_SCRIPT"
+echo "RUN_ENV=$RUN_ENV"
+
+if [[ -e "$LOCAL_MEGATRON_PATH/.git" ]]; then
+    MEGATRON_PATH="$LOCAL_MEGATRON_PATH"
+    echo "Using local Megatron-LM: $MEGATRON_PATH"
+    echo "  commit: $(git -C "$MEGATRON_PATH" rev-parse HEAD)"
+else
+    echo "Local Megatron-LM not found at $LOCAL_MEGATRON_PATH; cloning into $MEGATRON_TEMP_PATH_ROOT"
+    mkdir -p "$MEGATRON_TEMP_PATH_ROOT"
+    git clone "$MEGATRON_REPO" "$MEGATRON_TEMP_PATH_ROOT/Megatron-LM"
+    if [[ -n "$MEGATRON_BRANCH" ]]; then
+        git -C "$MEGATRON_TEMP_PATH_ROOT/Megatron-LM" checkout "$MEGATRON_BRANCH"
+    fi
+    MEGATRON_PATH="$MEGATRON_TEMP_PATH_ROOT/Megatron-LM"
+    echo "Using cloned Megatron-LM: $MEGATRON_PATH"
+    echo "  commit: $(git -C "$MEGATRON_PATH" rev-parse HEAD)"
+fi
 
 cd "$MEGATRON_PATH"
 export PYTHONPATH="$MEGATRON_PATH"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export NPROC PY_SCRIPT CKPT_DIR ITER PROMPT OUT_PT OUT_REPORT
-srun -ul --environment="$ENV_TOML" bash -lc '
+export MEGATRON_PATH NPROC_PER_NODE PY_SCRIPT CKPT_DIR ITER PROMPT OUT_PT OUT_REPORT TOKENIZER
+export MASTER_ADDR MASTER_PORT DISTRIBUTED_TIMEOUT_MINUTES
+srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" bash -lc '
 set -euo pipefail
+echo "NODE_RANK=${SLURM_NODEID}"
+cd "${MEGATRON_PATH}"
+export PYTHONPATH="${MEGATRON_PATH}"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 cmd=(
-  torchrun --nproc-per-node="${NPROC}" "${PY_SCRIPT}"
+  torchrun
+  --nnodes="${SLURM_NNODES}"
+  --nproc-per-node="${NPROC_PER_NODE}"
+  --node-rank="${SLURM_NODEID}"
+  --rdzv-backend=c10d
+  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}"
+  "${PY_SCRIPT}"
   --load "${CKPT_DIR}" \
   --ckpt-step "${ITER}" \
   --ckpt-format torch_dist \
   --auto-detect-ckpt-format \
   --use-checkpoint-args \
   --use-mp-args-from-checkpoint-args \
+  --tokenizer-type HuggingFaceTokenizer \
+  --tokenizer-model "${TOKENIZER}" \
+  --no-use-tokenizer-model-from-checkpoint-args \
+  --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES}" \
   --no-load-optim \
   --no-load-rng \
   --prompt "${PROMPT}" \

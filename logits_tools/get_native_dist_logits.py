@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import hashlib
+import itertools
 import json
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import partial
 
 import torch
@@ -10,6 +11,7 @@ import torch
 from gpt_builders import gpt_builder
 from model_provider import model_provider
 from megatron.core import mpu
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
@@ -92,6 +94,89 @@ def patch_te_set_extra_state_eof():
     cls._patched_ignore_eof_extra_state = True
 
 
+def pad_to_pipeline_shape(token_ids, pad_token_id: int, multiple: int = 32):
+    padded = list(token_ids)
+    remainder = len(padded) % multiple
+    if remainder:
+        padded.extend([pad_token_id] * (multiple - remainder))
+    return padded
+
+
+def build_batch(token_ids, tokenizer):
+    tokens = torch.tensor(token_ids, dtype=torch.long, device="cuda").unsqueeze(0)
+
+    eod_token = getattr(tokenizer, "eod", None)
+    if eod_token is None:
+        eod_token = getattr(tokenizer, "eos", 0)
+    pad_token = getattr(tokenizer, "pad", 0)
+
+    attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+        data=tokens,
+        eod_token=eod_token,
+        pad_token=pad_token,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        pad_mask_loss=False,
+    )
+
+    return {
+        "tokens": tokens,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+
+
+def native_forward_logits(model, batch, original_seq_len: int):
+    def non_loss_func(output_tensor, non_loss_data=True):
+        return output_tensor
+
+    def forward_step_func(data_iterator, model_chunk):
+        data = next(data_iterator)
+        tokens = data["tokens"]
+        position_ids = data["position_ids"]
+        attention_mask = data["attention_mask"]
+
+        output_tensor = model_chunk(tokens, position_ids, attention_mask)
+        return output_tensor, non_loss_func
+
+    for chunk in model:
+        chunk.eval()
+
+    vp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+    if vp_size is None:
+        num_microbatches = 1
+        data_iterator = iter([batch])
+    else:
+        config = model[0].config
+        num_microbatches = max(
+            1,
+            int(getattr(config, "microbatch_group_size_per_vp_stage", 0) or 0),
+            mpu.get_pipeline_model_parallel_world_size(),
+        )
+        data_iterator = [itertools.repeat(batch) for _ in range(len(model))]
+
+    forward_data = get_forward_backward_func()(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=batch["tokens"].shape[-1],
+        micro_batch_size=1,
+        decoder_seq_length=batch["tokens"].shape[-1],
+        forward_only=True,
+        collect_non_loss_data=True,
+    )
+
+    if not mpu.is_pipeline_last_stage():
+        return None
+    if not forward_data:
+        raise RuntimeError("Pipeline last stage produced no forward data.")
+
+    logits = gather_from_tensor_model_parallel_region(forward_data[0])
+    return logits[:, original_seq_len - 1, :].float().cpu()
+
+
 def extra_args(parser):
     group = parser.add_argument_group("native-logits")
     group.add_argument("--prompt", type=str, required=True)
@@ -113,47 +198,24 @@ def main():
     )
 
     args = get_args()
-    if args.pipeline_model_parallel_size != 1:
-        raise RuntimeError(
-            f"This minimal script assumes PP=1, got PP={args.pipeline_model_parallel_size}."
-        )
 
     patch_te_set_extra_state_eof()
 
     model = get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
     load_checkpoint(model, None, None, strict=True)
-    model = model[0]
-    model.eval()
 
     tokenizer = get_tokenizer()
     token_ids = [int(x) for x in tokenizer.tokenize(args.prompt)]
     if len(token_ids) == 0:
         raise RuntimeError("Prompt tokenized to an empty sequence.")
 
-    tokens = torch.tensor(token_ids, dtype=torch.long, device="cuda").unsqueeze(0)
-
-    eod_token = getattr(tokenizer, "eod", None)
-    if eod_token is None:
-        eod_token = getattr(tokenizer, "eos", 0)
     pad_token = getattr(tokenizer, "pad", 0)
+    padded_token_ids = pad_to_pipeline_shape(token_ids, pad_token_id=pad_token)
+    batch = build_batch(padded_token_ids, tokenizer)
+    last_token_logits = native_forward_logits(model, batch, original_seq_len=len(token_ids))
 
-    attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-        data=tokens,
-        eod_token=eod_token,
-        pad_token=pad_token,
-        reset_position_ids=False,
-        reset_attention_mask=False,
-        eod_mask_loss=False,
-        pad_mask_loss=False,
-    )
-
-    logits = model(tokens, position_ids, attention_mask)
-    if args.tensor_model_parallel_size > 1:
-        logits = gather_from_tensor_model_parallel_region(logits)
-    last_token_logits = logits[:, -1, :].float().cpu()
-
-    if mpu.get_tensor_model_parallel_rank() == 0:
-        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    if mpu.is_pipeline_last_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         iter_tag_raw = getattr(args, "ckpt_step", None)
         if iter_tag_raw is None:
             iter_tag = "iter_unknown"
@@ -168,8 +230,18 @@ def main():
         report = build_comparison_report(args.prompt, token_ids, last_token_logits)
         report["output_pt_path"] = out_pt
         report["output_report_path"] = out_report
+        report["megatron_checkpoint_path"] = os.path.abspath(args.load)
+        report["checkpoint_iteration"] = iter_tag_raw
         report["mode"] = "native_dist"
         report["timestamp_utc"] = timestamp
+        report["padded_num_prompt_tokens"] = int(len(padded_token_ids))
+        report["tensor_model_parallel_size"] = int(mpu.get_tensor_model_parallel_world_size())
+        report["pipeline_model_parallel_size"] = int(mpu.get_pipeline_model_parallel_world_size())
+        report["virtual_pipeline_model_parallel_size"] = (
+            None
+            if mpu.get_virtual_pipeline_model_parallel_world_size() is None
+            else int(mpu.get_virtual_pipeline_model_parallel_world_size())
+        )
 
         out_dir = os.path.dirname(out_pt)
         if out_dir:
