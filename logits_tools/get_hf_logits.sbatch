@@ -28,7 +28,6 @@ usage() {
     echo "  HF_DTYPE=bf16                         # bf16|fp16|fp32|auto"
     echo "  HF_DEVICE=cuda                        # cuda|cpu"
     echo "  HF_DEVICE_MAP=none                    # none|auto|balanced|sequential"
-    echo "  HF_MAX_MEMORY=                        # e.g. 0:90GiB,1:90GiB,2:90GiB,3:90GiB,cpu:200GiB"
     echo "  TRUST_REMOTE_CODE=1                   # pass --trust-remote-code"
     echo "  TRANSFORMERS_BRANCH=model/apertus     # swiss-ai transformers branch for apertus"
     echo "  SKIP_TRANSFORMERS_INSTALL=1           # set 0 to force pip install"
@@ -88,10 +87,10 @@ fi
 
 RUN_ENV="${RUN_ENV:-${PATH_TO_HFCONVERTER}/nemo.toml}"
 PY_SCRIPT="${TOOLS_DIR}/get_hf_logits.py"
+INNER_SCRIPT="${TOOLS_DIR}/run_hf_logits_inner.sh"
 HF_DTYPE="${HF_DTYPE:-bf16}"
 HF_DEVICE="${HF_DEVICE:-cuda}"
 HF_DEVICE_MAP="${HF_DEVICE_MAP:-none}"
-HF_MAX_MEMORY="${HF_MAX_MEMORY:-}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 TRANSFORMERS_BRANCH="${TRANSFORMERS_BRANCH:-model/apertus}"
 SKIP_TRANSFORMERS_INSTALL="${SKIP_TRANSFORMERS_INSTALL:-1}"
@@ -103,6 +102,11 @@ if [[ ! -f "$PY_SCRIPT" ]]; then
     echo "ERROR: Python script not found: $PY_SCRIPT"
     echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/)."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
+    exit 1
+fi
+if [[ ! -x "$INNER_SCRIPT" ]]; then
+    echo "ERROR: inner launcher not found or not executable: $INNER_SCRIPT"
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root, or run: chmod +x $INNER_SCRIPT"
     exit 1
 fi
 if [[ ! -f "$RUN_ENV" ]]; then
@@ -124,43 +128,28 @@ echo "RESULTS_DIR=$RESULTS_DIR"
 echo "HF_DTYPE=$HF_DTYPE"
 echo "HF_DEVICE=$HF_DEVICE"
 echo "HF_DEVICE_MAP=$HF_DEVICE_MAP"
-echo "HF_MAX_MEMORY=${HF_MAX_MEMORY:-<none>}"
 echo "TRANSFORMERS_BRANCH=$TRANSFORMERS_BRANCH"
 echo "SKIP_TRANSFORMERS_INSTALL=$SKIP_TRANSFORMERS_INSTALL"
 echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
 echo "PATH_TO_HFCONVERTER=$PATH_TO_HFCONVERTER"
 echo "TOOLS_DIR=$TOOLS_DIR"
 echo "PY_SCRIPT=$PY_SCRIPT"
+echo "INNER_SCRIPT=$INNER_SCRIPT"
 echo "RUN_ENV=$RUN_ENV"
 
-export PY_SCRIPT HF_CKPT_DIR OUT_PT OUT_REPORT PROMPT HF_DTYPE HF_DEVICE HF_DEVICE_MAP HF_MAX_MEMORY TRUST_REMOTE_CODE
-export TRANSFORMERS_BRANCH SKIP_TRANSFORMERS_INSTALL
-srun -ul --environment="$RUN_ENV" bash -lc '
-set -euo pipefail
-if [[ "${SKIP_TRANSFORMERS_INSTALL}" != "1" && -n "${TRANSFORMERS_BRANCH}" ]]; then
-  pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
-    "transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}"
-  pip install -v --no-cache-dir -U "huggingface-hub>=0.34.0,<1.0"
-fi
-cmd=(
-  python "${PY_SCRIPT}"
-  --hf-dir "${HF_CKPT_DIR}"
-  --prompt "${PROMPT}"
-  --out-pt "${OUT_PT}"
-  --dtype "${HF_DTYPE}"
-  --device "${HF_DEVICE}"
-  --device-map "${HF_DEVICE_MAP}"
+SRUN_EXPORTS=(
+  "PY_SCRIPT=${PY_SCRIPT}"
+  "HF_CKPT_DIR=${HF_CKPT_DIR}"
+  "OUT_PT=${OUT_PT}"
+  "OUT_REPORT=${OUT_REPORT}"
+  "PROMPT=${PROMPT}"
+  "HF_DTYPE=${HF_DTYPE}"
+  "HF_DEVICE=${HF_DEVICE}"
+  "HF_DEVICE_MAP=${HF_DEVICE_MAP}"
+  "TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}"
+  "TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH}"
+  "SKIP_TRANSFORMERS_INSTALL=${SKIP_TRANSFORMERS_INSTALL}"
 )
-if [[ -n "${HF_MAX_MEMORY}" ]]; then
-  cmd+=(--max-memory "${HF_MAX_MEMORY}")
-fi
-if [[ -n "${OUT_REPORT}" ]]; then
-  cmd+=(--out-report "${OUT_REPORT}")
-fi
-if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
-  cmd+=(--trust-remote-code)
-fi
-"${cmd[@]}"
-'
+srun -ul --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
 
 echo "END TIME: $(date)"

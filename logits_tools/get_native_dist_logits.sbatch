@@ -135,10 +135,16 @@ if [[ ! -d "${CKPT_DIR}/${ITER_DIR}" ]]; then
 fi
 
 PY_SCRIPT="${TOOLS_DIR}/get_native_dist_logits.py"
+INNER_SCRIPT="${TOOLS_DIR}/run_native_dist_logits_inner.sh"
 if [[ ! -f "$PY_SCRIPT" ]]; then
     echo "ERROR: Python script not found: $PY_SCRIPT"
     echo "Set PATH_TO_HFCONVERTER to your hfconverter root (with nemo.toml and logits_tools/)."
     echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
+    exit 1
+fi
+if [[ ! -x "$INNER_SCRIPT" ]]; then
+    echo "ERROR: inner launcher not found or not executable: $INNER_SCRIPT"
+    echo "Set PATH_TO_HFCONVERTER to your hfconverter root, or run: chmod +x $INNER_SCRIPT"
     exit 1
 fi
 if [[ ! -f "$RUN_ENV" ]]; then
@@ -169,6 +175,7 @@ echo "SLURM_SUBMIT_DIR=$SUBMIT_DIR"
 echo "PATH_TO_HFCONVERTER=$PATH_TO_HFCONVERTER"
 echo "TOOLS_DIR=$TOOLS_DIR"
 echo "PY_SCRIPT=$PY_SCRIPT"
+echo "INNER_SCRIPT=$INNER_SCRIPT"
 echo "RUN_ENV=$RUN_ENV"
 
 if [[ -e "$LOCAL_MEGATRON_PATH/.git" ]]; then
@@ -191,41 +198,20 @@ cd "$MEGATRON_PATH"
 export PYTHONPATH="$MEGATRON_PATH"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export MEGATRON_PATH NPROC_PER_NODE PY_SCRIPT CKPT_DIR ITER PROMPT OUT_PT OUT_REPORT TOKENIZER
-export MASTER_ADDR MASTER_PORT DISTRIBUTED_TIMEOUT_MINUTES
-srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" bash -lc '
-set -euo pipefail
-echo "NODE_RANK=${SLURM_NODEID}"
-cd "${MEGATRON_PATH}"
-export PYTHONPATH="${MEGATRON_PATH}"
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-cmd=(
-  torchrun
-  --nnodes="${SLURM_NNODES}"
-  --nproc-per-node="${NPROC_PER_NODE}"
-  --node-rank="${SLURM_NODEID}"
-  --rdzv-backend=c10d
-  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}"
-  "${PY_SCRIPT}"
-  --load "${CKPT_DIR}" \
-  --ckpt-step "${ITER}" \
-  --ckpt-format torch_dist \
-  --auto-detect-ckpt-format \
-  --use-checkpoint-args \
-  --use-mp-args-from-checkpoint-args \
-  --tokenizer-type HuggingFaceTokenizer \
-  --tokenizer-model "${TOKENIZER}" \
-  --no-use-tokenizer-model-from-checkpoint-args \
-  --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES}" \
-  --no-load-optim \
-  --no-load-rng \
-  --prompt "${PROMPT}" \
-  --out-pt "${OUT_PT}"
+SRUN_EXPORTS=(
+  "MEGATRON_PATH=${MEGATRON_PATH}"
+  "NPROC_PER_NODE=${NPROC_PER_NODE}"
+  "PY_SCRIPT=${PY_SCRIPT}"
+  "CKPT_DIR=${CKPT_DIR}"
+  "ITER=${ITER}"
+  "PROMPT=${PROMPT}"
+  "OUT_PT=${OUT_PT}"
+  "OUT_REPORT=${OUT_REPORT}"
+  "TOKENIZER=${TOKENIZER}"
+  "MASTER_ADDR=${MASTER_ADDR}"
+  "MASTER_PORT=${MASTER_PORT}"
+  "DISTRIBUTED_TIMEOUT_MINUTES=${DISTRIBUTED_TIMEOUT_MINUTES}"
 )
-if [[ -n "${OUT_REPORT}" ]]; then
-  cmd+=(--out-report "${OUT_REPORT}")
-fi
-"${cmd[@]}"
-'
+srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
 
 echo "END TIME: $(date)"

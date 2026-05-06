@@ -11,9 +11,6 @@ Set the topology explicitly to match the checkpoint. The conversion launcher che
 SLURM_NNODES * NPROC_PER_NODE == TENSOR_MODEL_PARALLEL_SIZE * PIPELINE_MODEL_PARALLEL_SIZE
 ```
 
-VPP does not add ranks. It only changes how layers are chunked within the physical PP
-ranks, so it is passed separately through one of the virtual pipeline flags.
-
 ```bash
 # 8B: TP=2, PP=1, 2 total ranks
 sbatch --nodes=1 \
@@ -56,10 +53,6 @@ only need to allocate the right number of torchrun ranks:
 SLURM_NNODES * NPROC_PER_NODE == checkpoint TP * checkpoint PP
 ```
 
-HF logits can use `HF_DEVICE_MAP=auto` for large converted models.
-For validation, `HF_DTYPE=fp16` can sometimes produce closer native-vs-HF logit
-agreement than the default `HF_DTYPE=bf16`, depending on the checkpoint and kernels.
-
 ```bash
 PROMPT="Sanity check prompt."
 
@@ -73,12 +66,17 @@ sbatch --nodes=8 --gpus-per-node=4 \
   --export=NPROC_PER_NODE=4,EXPECTED_TOTAL_RANKS=32 \
   logits_tools/get_native_dist_logits.sbatch <megatron_ckpt_dir> <iteration> "$PROMPT"
 
-# HF logits for converted output
+# 8B HF logits, single GPU/default device map
 sbatch logits_tools/get_hf_logits.sbatch <hf_ckpt_dir> "$PROMPT"
 
-# HF logits for a large model sharded over visible GPUs
+# 70B HF logits, sharded over visible GPUs
 sbatch --gpus-per-node=4 \
-  --export=HF_DEVICE_MAP=auto,HF_MAX_MEMORY=0:90GiB,1:90GiB,2:90GiB,3:90GiB,cpu:200GiB \
+  --export=HF_DEVICE_MAP=auto \
+  logits_tools/get_hf_logits.sbatch <hf_ckpt_dir> "$PROMPT"
+
+# Optional fp32 HF logits if bf16/fp16 behavior needs a stable reference
+sbatch --gpus-per-node=4 \
+  --export=HF_DEVICE_MAP=auto,HF_DTYPE=fp32 \
   logits_tools/get_hf_logits.sbatch <hf_ckpt_dir> "$PROMPT"
 
 # Compare generated reports. Use --pattern to keep one model/iteration together.
