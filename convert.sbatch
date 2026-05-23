@@ -30,8 +30,10 @@ MEGATRON_BRANCH=${MEGATRON_BRANCH:-multimodality/main}
 HFCONVERTER_REPO=${HFCONVERTER_REPO:-https://github.com/swiss-ai/hfconverter.git}
 HFCONVERTER_BRANCH=${HFCONVERTER_BRANCH:-main}
 
-LOCAL_HFCONVERTER_PATH=${LOCAL_HFCONVERTER_PATH:-}
-LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-}
+# Default to the dir you ran `sbatch` from (your hfconverter checkout) and the Megatron-LM
+# living next to it. Override the env vars to point elsewhere if your layout differs.
+LOCAL_HFCONVERTER_PATH=${LOCAL_HFCONVERTER_PATH:-$SLURM_SUBMIT_DIR}
+LOCAL_MEGATRON_PATH=${LOCAL_MEGATRON_PATH:-$LOCAL_HFCONVERTER_PATH/Megatron-LM}
 
 # Aux functions.
 usage() {
