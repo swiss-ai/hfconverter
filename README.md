@@ -123,6 +123,68 @@ entire exported model in CPU memory; omit it only when the allocation cannot
 hold a second model-sized copy. Per-shard bitwise verification remains enabled
 unless `--no-verify` is explicitly supplied.
 
+## How `exporter/` converts a checkpoint
+
+`exporter/` implements Stage 2 of the conversion. Its input must already be a
+Megatron Core `torch_dist/iter_XXXXXXX` directory. A legacy Megatron `torch`
+checkpoint must first be normalized by `cluster/stage1_torchdist.sbatch`.
+
+```text
+Megatron torch_dist checkpoint
+        │
+        ├─ saved arguments + global tensor metadata
+        v
+validate architecture and build an exact tensor/shard plan
+        │
+        ├─ load only the source tensors needed by the next shard
+        v
+split / transpose / rename tensors into Hugging Face layout
+        │
+        ├─ write and bitwise-verify one safetensors shard at a time
+        v
+copy tokenizer + custom Apertus MoE configuration/model code
+        │
+        ├─ optional full from_pretrained() verification
+        v
+conversion_info.json + completed Hugging Face directory
+```
+
+The pipeline is:
+
+1. `reader.py` reads the saved Megatron arguments and global tensor metadata.
+   `config_from_args.py` derives the Hugging Face architecture and rejects
+   checkpoint features that cannot be represented exactly. No model tensor
+   bytes are loaded at this stage.
+2. `mapping.py` separates model tensors from optimizer and scheduler state,
+   checks that every source model key is consumed exactly once, and plans every
+   Hugging Face key, shape, and dtype. `writer.py` computes the safetensors
+   shard layout from that metadata before allocating the tensors.
+3. `output_claim.py` claims the fresh output directory with
+   `.export_incomplete`. A failed or interrupted conversion deliberately leaves
+   this marker and any completed shards for diagnosis.
+4. `export.py` processes the planned output shards in order. For each shard,
+   Megatron Core reconstructs only the required source tensors. `mapping.py`
+   and `transforms.py` then split fused QKV and gate/up projections, rearrange
+   expert tensors, transpose layouts where required, and assign the Hugging
+   Face names. Parameters are not cast.
+5. `writer.py` writes the shard, reloads it, and checks every tensor's dtype and
+   value bitwise. Source tensors are released after their final output is
+   written, which keeps normal conversion memory bounded by the active sources
+   and shard instead of the complete model.
+6. The exporter writes the safetensors index, validates and copies the
+   tokenizer, creates `config.json`, and copies
+   `configuration_apertus_moe.py` and `modeling_apertus_moe.py`. The
+   `auto_map` entries in `config.json` let Transformers load these classes with
+   `trust_remote_code=True`.
+7. If `--verify-load` is enabled, the complete exported model is loaded through
+   `AutoModelForCausalLM.from_pretrained()` and compared with disk-backed
+   references. Finally, `conversion_info.json` records provenance and
+   verification settings, and `.export_incomplete` is removed.
+
+The pinned Chonk wrapper uses `VERIFY_LOAD=0`, so step 7 skips only the
+full-model reload. The bitwise verification in step 5 still runs for every
+safetensors shard.
+
 ## Load the Hugging Face model
 
 The model uses custom code from its own directory:
