@@ -1,0 +1,102 @@
+# apertus-moe-hf container for Stage 1, Stage 2, and tests.
+# STAGE1_ENV and HF_ENV select the EDF that points at the built squashfs image.
+#
+#   fork side (Stage 1): jobs export
+#     PYTHONPATH=/iopsstor/scratch/cscs/$USER/Megatron-LM-MoE — the LIVE fork
+#     checkout on scratch (the EDF mounts /iopsstor into every job), which
+#     shadows pip megatron-core: the same trick every fork job already uses on
+#     a139. No fork copy is baked into this image — jobs always run whatever
+#     the checkout holds. transformers is inert here.
+#   HF side (pytest and Stage 2 export): no
+#     PYTHONPATH — pip megatron-core 0.18 + transformers 5.8.1.
+#
+# Base = the CSCS jfrog mirror of NGC PyTorch (no NGC key needed) and the SAME
+# image as the fork's own fallback EDF ($FORK/_research/launch/alps3.toml).
+# It ships the CUDA torch — never install torch on top of it.
+FROM jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.01-py3-alps3
+
+# The one base-image fix: the base ships nvidia-resiliency-ext OLDER than 0.6.0,
+# and pip megatron-core 0.18 asserts >=0.6.0 at import whenever nvrx is
+# importable at all (this line is the entire bug that killed build job 2778427).
+# With nvrx ABSENT both sides degrade gracefully: mcore 0.18 takes its no-nvrx
+# path (what the hfdev312 venv validated), and the fork falls back to its own
+# checkpoint writer for the older fork-side tools.
+RUN pip uninstall -y nvidia-resiliency-ext
+
+# Pins mirror the validated hfdev312 venv (the stack the full test suite and the
+# ckpt1 export ran on). emerging-optimizers is the one extra the FORK needs:
+# the real ckpts store optimizer='md_decoupling', and older fork-side tools may
+# construct that optimizer during init. PyPI's oldest release is 0.3.0 (a139
+# carries 0.2.0; fork needs >=0.2) — the fork smoke test after the build proves
+# the API fits.
+#
+# WHY THERE IS STILL NO deep_gemm / grouped_gemm HERE (revisited 2026-07-25).
+# The original note — "all guarded, never hit by conversion" — is right about the
+# conversion and wrong about running a fork forward pass. Job 2894013
+# fork leg, 64 GPUs) died in the first MoE layer with
+#     AttributeError: 'NoneType' object has no attribute 'grouped_gemm'
+# at experts_offloading_fp8_util.py:1086. The imports ARE guarded
+# (:22-24 sets grouped_gemm = None), but the offloaded expert forward
+# dereferences it UNGUARDED. Guarded at import, fatal at use.
+#
+# grouped_gemm CANNOT be added: the fork calls
+# grouped_gemm.grouped_gemm.backend.tokens_per_expert_chunk_sum (:1086),
+# .batched_h2d_async (:1029) and .gmmfwd/.gmmbwd (experts_util.py, class
+# GroupedSwiMLP). NONE exist in either public package — checked
+# tgale96/grouped_gemm and fanshiqing/grouped_gemm (the one mcore pins), whose
+# backend exports only gmm/sinkhorn/permute/unpermute/unpermute_bwd. They come
+# from the fork author's own commit 96b5fff, in an image we cannot read.
+#
+# deep_gemm was tried and REVERTED (build job 2897631):
+#     error: [Errno 2] No such file or directory:
+#     '.../deep-gemm_.../third-party/cutlass/include/cute'
+# its PyPI sdist omits the CUTLASS submodules, so it needs a recursive git clone
+# plus a CUDA build, not a pip install.
+#
+# NEITHER IS NEEDED, because the standard Megatron path avoids both. The expert
+# class is chosen at transformer_engine_spec_provider.py:77-83:
+#     moe_use_grouped_gemm and moe_use_offloading_experts -> OffloadingExpertsMLP
+#     moe_use_grouped_gemm                                -> TEGroupedMLP
+# TEGroupedMLP uses TransformerEngine's grouped linear, which the NGC base
+# already ships — which is exactly why every 1.5b fork leg ran in this image.
+# Dropping --moe-use-offloading-experts therefore needs no new packages, and it
+# runs bf16 rather than fp8. What it DOES need is the checkpoint's expert tensors
+# rewritten from the offloaded (E, in, out) weight1/weight2 layout to
+# linear_fc1/linear_fc2 (E, out, in) — an offline conversion no image change can
+# substitute for.
+RUN pip install --no-cache-dir \
+        transformers==5.8.1 \
+        tokenizers==0.22.2 \
+        huggingface_hub==1.23.0 \
+        safetensors==0.8.0 \
+        accelerate==1.14.0 \
+        megatron-core==0.18.0 \
+        hf_xet==1.5.1 \
+        pytest==9.1.1 \
+        emerging-optimizers==0.3.0 \
+        absl-py regex typer httpx click
+
+# Fail the BUILD (not the first job) if the resolver clobbered torch, a
+# transformers v5-only internal is missing, or nvrx snuck back in.
+RUN python -c "\
+import sys, importlib.util, torch, transformers; \
+assert importlib.util.find_spec('nvidia_resiliency_ext') is None, 'stale nvrx still importable'; \
+assert torch.version.cuda, 'torch was replaced by a CPU wheel'; \
+assert transformers.__version__ == '5.8.1', transformers.__version__; \
+import transformers.initialization, transformers.conversion_mapping, transformers.masking_utils; \
+from transformers import PreTrainedConfig; \
+from huggingface_hub.dataclasses import strict; \
+import megatron.core; \
+from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp, NSCoeffT; \
+from emerging_optimizers.scalar_optimizers import Lion; \
+assert importlib.util.find_spec('triton') is not None, 'triton missing: the fork *_jit kernels need it'; \
+print('deps OK: python', sys.version.split()[0], '| torch', torch.__version__, \
+      '| transformers', transformers.__version__)"
+
+# Record what this image can and cannot run on the fork side, so nobody
+# rediscovers it with a 64-GPU job (as 2894013 did).
+LABEL ch.swiss-ai.fork-expert-path="TEGroupedMLP only (drop --moe-use-offloading-experts). \
+OffloadingExpertsMLP needs a private grouped_gemm build with \
+tokens_per_expert_chunk_sum/batched_h2d_async/gmmfwd, absent from all public releases. \
+Using TEGroupedMLP requires the checkpoint's expert tensors converted from \
+weight1/weight2 (E,in,out) to linear_fc1/linear_fc2 (E,out,in)."

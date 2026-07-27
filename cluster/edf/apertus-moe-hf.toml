@@ -1,0 +1,22 @@
+# Shared EDF for Stage 1, Stage 2, and tests (see cluster/container/).
+# STAGE1_ENV and HF_ENV default to this file. Stage 1 selects the live fork with
+# PYTHONPATH; HF-side jobs use the installed packages from the same image.
+#
+# image: built by cluster/container/build_container.sbatch (podman build +
+# enroot import on a compute node). A local .sqsh path is used in place —
+# no registry, no image cache involved.
+#
+# Mount set mirrors the training fallback EDF
+# ($FORK/_research/launch/alps3.toml): /capstor + /users + /iopsstor.
+# ${USER} is expanded from the host environment by the container engine.
+
+image = "/iopsstor/scratch/cscs/${USER}/images/apertus-moe-hf.sqsh"
+mounts = ["/capstor:/capstor", "/users:/users", "/iopsstor:/iopsstor"]
+workdir = "/iopsstor/scratch/cscs/${USER}/hfconverter"
+writable = true
+
+[env]
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.cxi.enabled = "false"

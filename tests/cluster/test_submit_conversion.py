@@ -1,0 +1,300 @@
+"""Login-node tests for the generic two-job conversion submitter.
+
+No SLURM job or model is run here.  ``sbatch`` is replaced by a small recorder.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import subprocess
+
+from gate_helpers import write_checkpoint
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SUBMITTER = REPO_ROOT / "cluster" / "submit_conversion.sh"
+
+
+def make_layout(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
+    source = tmp_path / "source-checkpoint"
+    source.mkdir()
+    write_checkpoint(
+        source,
+        {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 4,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+            "bf16": True,
+            "fp16": False,
+            "moe_router_load_balancing_type": "seq_aux_loss",
+            "moe_aux_loss_coeff": 1e-3,
+            "init_method_std": 0.0360844,
+            "layernorm_epsilon": 1e-5,
+            "sandwich_norm": True,
+            "moe_router_dtype": "fp32",
+            "transformer_impl": "transformer_engine",
+        },
+        iteration=730,
+    )
+
+    fork = tmp_path / "Megatron-LM-MoE"
+    tokenizer = fork / "_research" / "data" / "tokenizer"
+    tokenizer.mkdir(parents=True)
+    (fork / "pretrain_gpt.py").touch()
+    (tokenizer / "tokenizer.json").write_text("{}")
+
+    stage1_image = tmp_path / "stage1.sqsh"
+    stage1_image.touch()
+    stage1_env = tmp_path / "stage1.toml"
+    stage1_env.write_text(f'image = "{stage1_image}"\n')
+    image = tmp_path / "hf.sqsh"
+    image.touch()
+    hf_env = tmp_path / "hf.toml"
+    hf_env.write_text(f'image = "{image}"\n')
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    count = tmp_path / "sbatch.count"
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"printf '%s | SRC_EP=%s SANDWICH_NORM=%s MOE_AUX_LOSS_COEFF=%s "
+        f"STAGE1_ENV=%s TRUST_LEGACY_CHECKPOINT=%s HF_ENV=%s TD_ITER_DIR=%s HF_OUT_DIR=%s VERIFY_LOAD=%s SKIP_INSPECT=<%s> FORCE_NO=<%s> FORCE_YES=<%s>\\n' "
+        f"\"$*\" \"${{SRC_EP-}}\" \"${{SANDWICH_NORM-}}\" "
+        f"\"${{MOE_AUX_LOSS_COEFF-}}\" \"${{STAGE1_ENV-}}\" \"${{TRUST_LEGACY_CHECKPOINT-}}\" \"${{HF_ENV-}}\" \"${{TD_ITER_DIR-}}\" "
+        f"\"${{HF_OUT_DIR-}}\" \"${{VERIFY_LOAD-}}\" \"${{SKIP_INSPECT-}}\" "
+        f"\"${{TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD-__UNSET__}}\" \"${{TORCH_FORCE_WEIGHTS_ONLY_LOAD-__UNSET__}}\" >> {calls}\n"
+        f"n=0; [ ! -f {count} ] || n=$(<{count}); n=$((n + 1)); "
+        f"printf '%s' \"$n\" > {count}\n"
+        "printf '4100%s\\n' \"$n\"\n"
+    )
+    sbatch.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        PATH=f"{fake_bin}:{os.environ['PATH']}",
+        REPO=str(REPO_ROOT),
+        MEGATRON_PATH=str(fork),
+        TOKENIZER_DIR=str(tokenizer),
+        STAGE1_ENV=str(stage1_env),
+        TRUST_LEGACY_CHECKPOINT="1",
+        HF_ENV=str(hf_env),
+        LOG_DIR=str(tmp_path / "logs"),
+        SRC_TP="1",
+        SRC_PP="1",
+        SRC_EP="4",
+        SRC_ETP="1",
+        SRC_CP="1",
+        PRECISION="bf16",
+        ROUTING_TYPE="seq_aux_loss",
+        MOE_AUX_LOSS_COEFF="1e-3",
+        INIT_METHOD_STD="0.0360844",
+        NORM_EPSILON="1e-5",
+        SANDWICH_NORM="1",
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1",
+        TORCH_FORCE_WEIGHTS_ONLY_LOAD="1",
+    )
+    return env, source, tmp_path / "converted", calls
+
+
+def run_submitter(
+    env: dict[str, str], source: Path, output: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(SUBMITTER), str(source), str(output)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_script_has_valid_bash_syntax():
+    result = subprocess.run(
+        ["bash", "-n", str(SUBMITTER)], check=False, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_submits_only_stage1_then_dependent_stage2(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    submitted = calls.read_text().splitlines()
+    assert len(submitted) == 2
+    assert "stage1_torchdist.sbatch" in submitted[0]
+    assert f" {source} {output}" in submitted[0]
+    assert "SRC_EP=4" in submitted[0]
+    assert "MOE_AUX_LOSS_COEFF=1e-3" in submitted[0]
+    assert "SANDWICH_NORM=1" in submitted[0]
+    assert f"STAGE1_ENV={env['STAGE1_ENV']}" in submitted[0]
+    assert "TRUST_LEGACY_CHECKPOINT=1" in submitted[0]
+    assert f"HF_ENV={env['HF_ENV']}" in submitted[1]
+    assert env["STAGE1_ENV"] != env["HF_ENV"]
+
+    assert "stage2_export.sbatch" in submitted[1]
+    assert "--dependency=afterok:41001" in submitted[1]
+    assert f"TD_ITER_DIR={output}/torch_dist/iter_0000730" in submitted[1]
+    assert f"HF_OUT_DIR={output}/hf" in submitted[1]
+    assert "VERIFY_LOAD=1" in submitted[1]
+    assert "SKIP_INSPECT=<>" in submitted[1]
+    assert "FORCE_NO=<__UNSET__>" in submitted[1]
+    assert "FORCE_YES=<__UNSET__>" in submitted[1]
+    assert "Stage 1 job: 41001" in result.stdout
+    assert "Stage 2 job: 41002" in result.stdout
+
+
+def test_missing_profile_value_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env.pop("SANDWICH_NORM")
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "SANDWICH_NORM is required" in result.stderr
+    assert not calls.exists()
+
+
+def test_missing_trusted_checkpoint_assertion_fails_before_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env.pop("TRUST_LEGACY_CHECKPOINT")
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "set TRUST_LEGACY_CHECKPOINT=1" in result.stderr
+    assert not calls.exists()
+    assert not output.exists()
+
+
+def test_missing_stage1_environment_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    missing_environment = tmp_path / "missing-stage1.toml"
+    env["STAGE1_ENV"] = str(missing_environment)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert f"Stage 1 environment file is not readable: {missing_environment}" in result.stderr
+    assert not calls.exists()
+    assert not output.exists()
+
+
+def test_relative_stage1_environment_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env["STAGE1_ENV"] = "relative-stage1.toml"
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "STAGE1_ENV must be an absolute EDF path" in result.stderr
+    assert not calls.exists()
+    assert not output.exists()
+
+
+def test_stage1_environment_is_canonicalized_before_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    real_environment = Path(env["STAGE1_ENV"])
+    environment_link = tmp_path / "stage1-link.toml"
+    environment_link.symlink_to(real_environment)
+    env["STAGE1_ENV"] = str(environment_link)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    stage1 = calls.read_text().splitlines()[0]
+    assert f"STAGE1_ENV={real_environment.resolve()}" in stage1
+    assert str(environment_link) not in stage1
+
+
+def test_nonempty_output_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    output.mkdir()
+    (output / "old-result").touch()
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "output root is not empty" in result.stderr
+    assert not calls.exists()
+
+
+def test_output_inside_source_is_rejected(tmp_path: Path):
+    env, source, _, calls = make_layout(tmp_path)
+
+    result = run_submitter(env, source, source / "converted")
+
+    assert result.returncode != 0
+    assert "must not be inside the source checkpoint" in result.stderr
+    assert not calls.exists()
+
+
+def test_dotdot_cannot_bypass_source_containment(tmp_path: Path):
+    env, source, _, calls = make_layout(tmp_path)
+    disguised = source / ".." / source.name / "converted"
+
+    result = run_submitter(env, source, disguised)
+
+    assert result.returncode != 0
+    assert "must not be inside the source checkpoint" in result.stderr
+    assert not calls.exists()
+
+
+def test_symlink_cannot_bypass_source_containment(tmp_path: Path):
+    env, source, _, calls = make_layout(tmp_path)
+    link = tmp_path / "checkpoint-link"
+    link.symlink_to(source, target_is_directory=True)
+
+    result = run_submitter(env, source, link / "converted")
+
+    assert result.returncode != 0
+    assert "must not be inside the source checkpoint" in result.stderr
+    assert not calls.exists()
+
+
+def test_profile_mismatch_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env["MOE_AUX_LOSS_COEFF"] = "1e-4"
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "moe_aux_loss_coeff" in result.stderr
+    assert not calls.exists()
+
+
+def test_unsupported_source_topology_fails_before_any_submission(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env["SRC_TP"] = "2"
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "needs 8 ranks" in result.stderr
+    assert not calls.exists()
+
+
+def test_stale_ambient_stage2_values_are_overridden(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env.update(
+        TD_ITER_DIR="/stale/torch-dist",
+        HF_OUT_DIR="/stale/hf",
+        VERIFY_LOAD="0",
+        SKIP_INSPECT="1",
+    )
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    stage2 = calls.read_text().splitlines()[1]
+    assert f"TD_ITER_DIR={output}/torch_dist/iter_0000730" in stage2
+    assert f"HF_OUT_DIR={output}/hf" in stage2
+    assert "VERIFY_LOAD=1" in stage2
+    assert "SKIP_INSPECT=<>" in stage2
+    assert "/stale/" not in stage2
