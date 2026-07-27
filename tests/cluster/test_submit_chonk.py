@@ -78,6 +78,7 @@ def test_test_only_uses_overrides_and_does_not_submit(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr
     assert "--test-only" in calls.read_text()
+    assert "--time=01:30:00" in calls.read_text()
     assert "VERIFY_LOAD=0" in calls.read_text()
     assert str(output) in result.stdout
 

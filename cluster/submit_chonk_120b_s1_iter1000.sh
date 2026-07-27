@@ -25,7 +25,7 @@ HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
 LOG_DIR=${LOG_DIR:-$REPO/cluster/logs/chonk-120b-s1-iter1000}
 
 PARTITION=${PARTITION:-normal}
-TIME_LIMIT=${TIME_LIMIT:-08:00:00}
+TIME_LIMIT=${TIME_LIMIT:-01:30:00}
 MEM_MIB=${MEM_MIB:-460000}
 VERIFY_LOAD=0
 EXTRA_EXPORT_ARGS="--max-shard-size 5GB"
