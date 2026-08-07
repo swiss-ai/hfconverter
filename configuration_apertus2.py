@@ -44,12 +44,6 @@ class Apertus2Config(PreTrainedConfig):
     - ``embedding_multiplier`` scales token embeddings once, before the decoder stack.
     - ``residual_multiplier`` scales both attention and feed-forward branch outputs before they
       are added back to the residual stream.
-    - ``keel`` selects the Megatron KEEL residual rule:
-      ``post_norm(keel_alpha * x + branch(pre_norm(x)))``.  Layer zero has the Megatron special
-      case: carry scale 1 and no attention post-norm.  KEEL and sandwich norm are alternative
-      uses of the same checkpoint slots, so they cannot be enabled together.
-    - ``keel_alpha`` optionally overrides KEEL's default carry scale of
-      ``2 * num_hidden_layers``.
 
     Two independent per-layer schedules describe attention:
 
@@ -131,8 +125,6 @@ class Apertus2Config(PreTrainedConfig):
     moe_layer_freq: list[int] | None = None
     norm_topk_prob: bool = True
     sandwich_norm: bool = False
-    keel: bool = False
-    keel_alpha: float | None = None
     moe_latent_size: int | None = None
     use_quantile_balancing: bool = False
     embedding_multiplier: float = 27.712812921102035
@@ -143,9 +135,17 @@ class Apertus2Config(PreTrainedConfig):
 
     def __post_init__(self, **kwargs):
         """Validate choices that would otherwise create a silently different model."""
+        # Older exports may carry these inactive fields. Normalize false/null away, but reject
+        # active values so a removed residual mode can never degrade silently to the plain path.
+        keel = kwargs.pop("keel", False)
+        keel_alpha = kwargs.pop("keel_alpha", None)
+        if keel or keel_alpha is not None:
+            raise ValueError(
+                "KEEL residual mode is not supported; re-export the checkpoint without "
+                f"keel/keel_alpha (got keel={keel!r}, keel_alpha={keel_alpha!r})."
+            )
         self._validate_checkpoint_contract()
         self._validate_router_options()
-        self._validate_residual_mode()
         self._set_mlp_schedule()
         self._set_attention_schedules()
         self._set_full_rotary_defaults(kwargs)
@@ -179,26 +179,6 @@ class Apertus2Config(PreTrainedConfig):
                 f"use_quantile_balancing=True is incompatible with group-limited routing "
                 f"(got n_group={self.n_group}, topk_group={self.topk_group}); the Megatron fork "
                 "forbids QB with num_groups/group_topk set. Use n_group=1 and topk_group=1."
-            )
-
-    def _validate_residual_mode(self) -> None:
-        """Reject ambiguous combinations of the plain, sandwich, and KEEL residual rules."""
-        if self.keel and self.sandwich_norm:
-            raise ValueError(
-                "keel=True is incompatible with sandwich_norm=True: KEEL and sandwich norm both "
-                "drive the post-attention / post-feedforward norm slots but with different "
-                "residual compositions. Enable exactly one."
-            )
-        if self.keel and self.residual_multiplier != 1.0:
-            raise ValueError(
-                "keel=True requires residual_multiplier=1.0: the Megatron fork forbids KEEL with "
-                "--residual-output-scaling (KEEL carries the residual by keel_alpha instead). "
-                f"Got residual_multiplier={self.residual_multiplier}."
-            )
-        if self.keel_alpha is not None and not self.keel:
-            raise ValueError(
-                f"keel_alpha={self.keel_alpha} was set but keel=False; keel_alpha only applies "
-                "when keel=True."
             )
 
     def _set_mlp_schedule(self) -> None:

@@ -387,30 +387,24 @@ def _derive_attention_window(
     return sliding_window, layer_types
 
 
-def _validate_residual_scheme(
-    args: Namespace, support: _SupportBoundary
-) -> tuple[bool, Any]:
-    """Validate supported post-norm/residual schemes and return KEEL settings."""
-    keel = bool(_req(args, "keel"))
-    keel_alpha = getattr(args, "keel_alpha", None)
-    sandwich_norm = bool(_req(args, "sandwich_norm"))
-    residual_output_scaling = bool(_req(args, "residual_output_scaling"))
+def _validate_residual_scheme(args: Namespace, support: _SupportBoundary) -> None:
+    """Validate residual options represented by the Hugging Face implementation."""
     fp32_residual = getattr(args, "fp32_residual_connection", False)
     support.require(
         not fp32_residual, "args.fp32_residual_connection is falsy", fp32_residual
     )
+    keel = bool(getattr(args, "keel", False))
     support.require(
-        not (keel and sandwich_norm),
-        "not (args.keel and args.sandwich_norm) (KEEL is mutually exclusive with sandwich_norm)",
-        (keel, sandwich_norm),
+        not keel,
+        "args.keel is falsy (KEEL residual mode is not supported)",
+        keel,
     )
+    keel_alpha = getattr(args, "keel_alpha", None)
     support.require(
-        not (keel and residual_output_scaling),
-        "not (args.keel and args.residual_output_scaling) (the fork forbids KEEL with "
-        "--residual-output-scaling; KEEL carries the residual by keel_alpha)",
-        (keel, residual_output_scaling),
+        keel_alpha is None,
+        "args.keel_alpha is None (KEEL residual mode is not supported)",
+        keel_alpha,
     )
-    return keel, keel_alpha
 
 
 def _validate_router_and_attention(args: Namespace, support: _SupportBoundary) -> None:
@@ -609,7 +603,7 @@ def derive_config(args: Namespace) -> DerivedConfig:
     rope_parameters = _derive_rope_parameters(args, support)
     no_rope_layers = _derive_no_rope_layers(args, support, num_layers)
     sliding_window, layer_types = _derive_attention_window(args, support, num_layers)
-    keel, keel_alpha = _validate_residual_scheme(args, support)
+    _validate_residual_scheme(args, support)
     _validate_router_and_attention(args, support)
     offloaded_experts = _derive_expert_storage(args, support)
 
@@ -716,8 +710,6 @@ def derive_config(args: Namespace) -> DerivedConfig:
         "use_qk_norm": bool(_req(args, "qk_layernorm")),
         "sandwich_norm": bool(_req(args, "sandwich_norm")),
         "moe_latent_size": _req(args, "moe_latent_size"),
-        "keel": keel,
-        "keel_alpha": keel_alpha,
         "use_quantile_balancing": use_quantile_balancing,
         "embedding_multiplier": embedding_multiplier,
         "residual_multiplier": residual_multiplier,

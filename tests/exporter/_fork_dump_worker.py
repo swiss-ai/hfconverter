@@ -71,17 +71,13 @@ def _free_port():
     return port
 
 
-def build_model(moe_layer_freq, keel=False):
+def build_model(moe_layer_freq):
     from megatron.core import parallel_state
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     parallel_state.initialize_model_parallel(1, 1)
-    # KEEL is mutually exclusive with sandwich_norm and with residual_output_scaling (the fork's
-    # TransformerConfig guards both). The block spec builds the post-norm slots when
-    # `sandwich_norm or keel`, and the layer makes post_self_attn_layernorm an IdentityOp on the
-    # first layer under KEEL -> no on-disk key for decoder.layers.0.post_self_attn_layernorm.
     config = TransformerConfig(
         num_layers=3,
         hidden_size=HIDDEN,
@@ -96,9 +92,8 @@ def build_model(moe_layer_freq, keel=False):
         activation_func=torch.nn.functional.silu,
         add_bias_linear=False,
         qk_layernorm=True,
-        sandwich_norm=not keel,
-        keel=keel,
-        residual_output_scaling=not keel,
+        sandwich_norm=True,
+        residual_output_scaling=True,
         num_moe_experts=EXPERTS,
         moe_router_topk=2,
         moe_ffn_hidden_size=MOE_FFN,
@@ -127,10 +122,10 @@ def build_model(moe_layer_freq, keel=False):
     return model
 
 
-def dump(out_path, moe_layer_freq, keel=False):
+def dump(out_path, moe_layer_freq):
     from megatron.core import dist_checkpointing
 
-    model = build_model(moe_layer_freq, keel=keel)
+    model = build_model(moe_layer_freq)
     payload = {"keys": {}, "tensors": {}, "fork_ref": {}}
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -215,16 +210,13 @@ def main():
     parser.add_argument("out")
     parser.add_argument("--moe-layer-freq-int", action="store_true",
                         help="use int moe_layer_freq (=1) -> homogeneous, layer-index-free keys")
-    parser.add_argument("--keel", action="store_true",
-                        help="build a KEEL model (sandwich_norm off, residual_output_scaling off) "
-                             "-> post_self_attn_layernorm absent on layer 0")
     args = parser.parse_args()
 
     _cpu_shim()
     dist.init_process_group(backend="gloo", world_size=1, rank=0,
                             init_method=f"tcp://127.0.0.1:{_free_port()}")
     try:
-        dump(args.out, 1 if args.moe_layer_freq_int else [0, 1, 1], keel=args.keel)
+        dump(args.out, 1 if args.moe_layer_freq_int else [0, 1, 1])
     finally:
         dist.destroy_process_group()
 

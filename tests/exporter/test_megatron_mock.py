@@ -26,8 +26,8 @@ from megatron_mock import (  # noqa: E402
 )
 
 COMBO_PARAMS = [
-    pytest.param(sandwich, latent, qb, expert_bias, keel, id=combo_id)
-    for combo_id, sandwich, latent, qb, expert_bias, keel in ROUNDTRIP_COMBOS
+    pytest.param(sandwich, latent, qb, expert_bias, id=combo_id)
+    for combo_id, sandwich, latent, qb, expert_bias in ROUNDTRIP_COMBOS
 ]
 
 
@@ -44,7 +44,6 @@ def expected_fork_keys(
     latent=False,
     qb=False,
     expert_bias=True,
-    keel=False,
 ):
     keys = {
         "embedding.word_embeddings.weight",
@@ -62,11 +61,6 @@ def expected_fork_keys(
         }
         if sandwich:
             keys |= {p + "post_self_attn_layernorm.weight", p + "post_mlp_layernorm.weight"}
-        if keel:
-            # post_self_attn only for L>=1 (IdentityOp on layer 0); post_mlp on all layers
-            if L > 0:
-                keys.add(p + "post_self_attn_layernorm.weight")
-            keys.add(p + "post_mlp_layernorm.weight")
         if L < first_k_dense:
             keys |= {
                 p + "mlp.linear_fc1.layer_norm_weight",
@@ -91,9 +85,9 @@ def expected_fork_keys(
     return keys
 
 
-def _mock_pair(sandwich, latent, qb, expert_bias, keel=False, seed=0):
+def _mock_pair(sandwich, latent, qb, expert_bias, seed=0):
     model = megatron_mock.build_tiny_model(
-        sandwich, latent, qb, seed=seed, zero_expert_bias=not expert_bias, keel=keel
+        sandwich, latent, qb, seed=seed, zero_expert_bias=not expert_bias
     )
     tensors = megatron_mock.to_megatron_tensors(
         model, model.config, expert_bias_present=expert_bias
@@ -107,11 +101,11 @@ def _mock_pair(sandwich, latent, qb, expert_bias, keel=False, seed=0):
 
 
 class TestKeySet:
-    @pytest.mark.parametrize("sandwich,latent,qb,expert_bias,keel", COMBO_PARAMS)
-    def test_key_set_matches_contract(self, sandwich, latent, qb, expert_bias, keel):
-        _, tensors = _mock_pair(sandwich, latent, qb, expert_bias, keel=keel)
+    @pytest.mark.parametrize("sandwich,latent,qb,expert_bias", COMBO_PARAMS)
+    def test_key_set_matches_contract(self, sandwich, latent, qb, expert_bias):
+        _, tensors = _mock_pair(sandwich, latent, qb, expert_bias)
         expected = expected_fork_keys(
-            sandwich=sandwich, latent=latent is not None, qb=qb, expert_bias=expert_bias, keel=keel
+            sandwich=sandwich, latent=latent is not None, qb=qb, expert_bias=expert_bias
         )
         assert set(tensors) == expected, (
             f"missing={sorted(expected - set(tensors))} "
@@ -313,7 +307,6 @@ REQUIRED_ARGS_ATTRS = [
     "residual_output_scaling",
     "multi_latent_attention",
     "mtp_num_layers",
-    "keel",
     "pnglu",
     "use_mup",
     "attention_output_gate",

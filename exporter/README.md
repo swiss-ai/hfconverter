@@ -120,7 +120,7 @@ the test suite and production export, including:
 - standard and latent routed experts, a shared expert, expert bias, and
   quantile-balancing state;
 - regular and offloaded expert checkpoint layouts;
-- sandwich-norm and KEEL residual layouts;
+- plain and sandwich-norm residual layouts;
 - full/sliding attention schedules and per-layer RoPE/NoPE schedules;
 - BF16 or FP16 model parameters with FP32 router computation.
 
@@ -128,8 +128,9 @@ This is not a generic Megatron converter. The argument preflight rejects
 semantics that the custom Hugging Face model cannot reproduce exactly, such as
 homogeneous layer-axis checkpoints, multi-latent attention, active MTP,
 parameter biases, tied input/output embeddings, interleaved or partial RoPE,
-expert capacity dropping, and unsupported router modes. A rejection happens
-before output tensors are written and names the offending checkpoint option.
+expert capacity dropping, KEEL residual mode, and unsupported router modes. A
+rejection happens before output tensors are written and names the offending
+checkpoint option.
 
 ## Verification certificate
 

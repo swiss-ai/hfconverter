@@ -129,7 +129,6 @@ class _Geometry:
     moe_layer_freq: tuple[int, ...]
     num_layers: int
     use_sandwich_norm: bool
-    use_keel: bool
     use_qk_norm: bool
     use_quantile_balancing: bool
 
@@ -166,7 +165,6 @@ class _Geometry:
             moe_layer_freq=tuple(int(entry) for entry in schedule),
             num_layers=num_layers,
             use_sandwich_norm=config["sandwich_norm"],
-            use_keel=config.get("keel", False),
             use_qk_norm=config["use_qk_norm"],
             use_quantile_balancing=config["use_quantile_balancing"],
         )
@@ -260,9 +258,7 @@ def _post_norm_rows(layer_index: int, shape: _Geometry) -> list[Row]:
     hf = f"model.layers.{layer_index}"
     rows: list[Row] = []
 
-    # Sandwich norm adds both post norms on every layer. KEEL omits the first layer's
-    # post-attention norm because the Megatron fork uses an identity operation there.
-    if shape.use_sandwich_norm or (shape.use_keel and layer_index > 0):
+    if shape.use_sandwich_norm:
         rows.append(
             Row(
                 f"{megatron}.post_self_attn_layernorm.weight",
@@ -271,7 +267,7 @@ def _post_norm_rows(layer_index: int, shape: _Geometry) -> list[Row]:
                 (shape.hidden_size,),
             )
         )
-    if shape.use_sandwich_norm or shape.use_keel:
+    if shape.use_sandwich_norm:
         rows.append(
             Row(
                 f"{megatron}.post_mlp_layernorm.weight",

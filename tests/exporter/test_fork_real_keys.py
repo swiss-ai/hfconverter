@@ -219,64 +219,6 @@ class TestForkLayouts:
         assert fc2_shape == (geo["experts"], geo["hidden"], geo["moe_ffn"])
 
 
-@pytest.fixture(scope="module")
-def fork_dump_keel(tmp_path_factory):
-    """Real fork GPTModel built with keel=True -> on-disk key namespace (KEEL post-norm layout)."""
-    if not FORK_PATH.is_dir():
-        pytest.skip(f"fork checkout not present at {FORK_PATH}")
-    out = tmp_path_factory.mktemp("forkdumpkeel") / "dump.pt"
-    env = dict(os.environ, PYTHONPATH=str(FORK_PATH), PYTHONWARNINGS="ignore")
-    proc = subprocess.run(
-        [sys.executable, str(WORKER), str(out), "--keel"],
-        env=env, capture_output=True, text=True, timeout=900,
-    )
-    if proc.returncode != 0:
-        pytest.skip(f"fork KEEL model could not be built on CPU:\n{proc.stderr[-2000:]}")
-    return torch.load(out, weights_only=False)
-
-
-class TestForkKeelKeys:
-    """The KEEL post-norm key namespace against a REAL fork GPTModel (keel=True).
-
-    KEEL and sandwich_norm both drive the post_self_attn/post_mlp slots but with different residual
-    math; the exporter's row gating must match what the fork actually writes. The load-bearing
-    asymmetry: the fork makes post_self_attn_layernorm an IdentityOp on the FIRST layer (no on-disk
-    key), while post_mlp_layernorm exists on every layer.
-    """
-
-    def test_post_self_attn_norm_absent_on_layer0_present_afterwards(self, fork_dump_keel):
-        keys = set(fork_dump_keel["keys"])
-        assert "decoder.layers.0.post_self_attn_layernorm.weight" not in keys, (
-            "KEEL: layer-0 attention post-norm is an IdentityOp -> must have no on-disk key"
-        )
-        for layer in range(1, 3):
-            assert f"decoder.layers.{layer}.post_self_attn_layernorm.weight" in keys
-
-    def test_post_mlp_norm_present_on_every_layer_including_layer0(self, fork_dump_keel):
-        keys = set(fork_dump_keel["keys"])
-        for layer in range(3):
-            assert f"decoder.layers.{layer}.post_mlp_layernorm.weight" in keys
-
-    def test_exporter_keel_plan_matches_the_keys_the_fork_writes(self, fork_dump_keel):
-        geo = fork_dump_keel["geometry"]
-        cfg = dict(
-            vocab_size=geo["vocab"], hidden_size=geo["hidden"], intermediate_size=geo["ffn"],
-            num_hidden_layers=3, num_attention_heads=geo["heads"],
-            num_key_value_heads=geo["kv_heads"], head_dim=geo["head_dim"],
-            n_routed_experts=geo["experts"], num_experts_per_tok=2,
-            moe_intermediate_size=geo["moe_ffn"], n_shared_experts=1, first_k_dense_replace=1,
-            use_qk_norm=True, sandwich_norm=False, keel=True, moe_latent_size=None,
-            use_quantile_balancing=True,
-        )
-        plan = build_plan(cfg, expert_bias_present=True)
-        fork_keys = _localspec_to_te(set(fork_dump_keel["keys"]), first_k_dense=1)
-        expected = {row.megatron_key for row in plan.rows}
-        missing = sorted(fork_keys - expected)  # fork writes it, exporter would not consume it
-        extra = sorted(expected - fork_keys)  # exporter demands it, fork does not write it
-        assert not missing, f"fork writes KEEL keys the exporter does not map: {missing}"
-        assert not extra, f"exporter expects KEEL keys the fork does not write: {extra}"
-
-
 class TestHomogeneousKeys:
     """An int moe_layer_freq folds the layer index into a tensor axis -> our mapping cannot read it."""
 

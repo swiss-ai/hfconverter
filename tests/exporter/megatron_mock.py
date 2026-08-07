@@ -51,17 +51,14 @@ TINY_EPS = 1e-5
 TINY_EMBEDDING_MULTIPLIER = math.sqrt(TINY_HIDDEN)  # 5.656854249492381
 TINY_RESIDUAL_MULTIPLIER = 1.0 / math.sqrt(2 * TINY_LAYERS)  # 0.4082482904638631
 
-# Round-trip flag matrix: (id, sandwich, latent, qb, expert_bias_present, keel).
+# Round-trip flag matrix: (id, sandwich, latent, qb, expert_bias_present).
 # QB + expert_bias on for (F,F) and (T,T); QB off elsewhere; plus one expert_bias-absent case.
-# keel is mutually exclusive with sandwich_norm (a checkpoint can carry at most one post-norm
-# scheme); the KEEL combo exercises the layer-0 post_attention_layernorm ABSENCE.
 ROUNDTRIP_COMBOS = [
-    ("plain-qb-bias", False, None, True, True, False),
-    ("sandwich", True, None, False, True, False),
-    ("latent", False, TINY_LATENT, False, True, False),
-    ("sandwich-latent-qb-bias", True, TINY_LATENT, True, True, False),
-    ("plain-no-expert-bias", False, None, False, False, False),
-    ("keel-latent", False, TINY_LATENT, False, True, True),
+    ("plain-qb-bias", False, None, True, True),
+    ("sandwich", True, None, False, True),
+    ("latent", False, TINY_LATENT, False, True),
+    ("sandwich-latent-qb-bias", True, TINY_LATENT, True, True),
+    ("plain-no-expert-bias", False, None, False, False),
 ]
 
 
@@ -69,20 +66,11 @@ def tiny_export_config(
     sandwich_norm=False,
     moe_latent_size=None,
     use_quantile_balancing=False,
-    keel=False,
-    keel_alpha=None,
     **overrides,
 ):
-    """Apertus2Config at the frozen tiny geometry, exporter-consistent multipliers.
-
-    KEEL forbids residual scaling (the fork refuses --keel with --residual-output-scaling; the
-    config guards residual_multiplier != 1.0), so a keel config carries residual_multiplier == 1.0
-    instead of the usual tiny 1/sqrt(2*num_layers). Mutually exclusive with sandwich_norm.
-    """
+    """Apertus2Config at the frozen tiny geometry, exporter-consistent multipliers."""
     from configuration_apertus2 import Apertus2Config
 
-    # KEEL carries the residual by keel_alpha, not by a fixed multiplier -> residual_multiplier 1.0
-    residual_multiplier = 1.0 if keel else TINY_RESIDUAL_MULTIPLIER
     kwargs = dict(
         vocab_size=TINY_VOCAB,
         hidden_size=TINY_HIDDEN,
@@ -113,12 +101,10 @@ def tiny_export_config(
         n_group=1,
         topk_group=1,
         sandwich_norm=sandwich_norm,
-        keel=keel,
-        keel_alpha=keel_alpha,
         moe_latent_size=moe_latent_size,
         use_quantile_balancing=use_quantile_balancing,
         embedding_multiplier=TINY_EMBEDDING_MULTIPLIER,
-        residual_multiplier=residual_multiplier,
+        residual_multiplier=TINY_RESIDUAL_MULTIPLIER,
         initializer_range=0.02,
         use_cache=True,
     )
@@ -133,8 +119,6 @@ def build_tiny_model(
     seed=0,
     randomize_router_buffers=True,
     zero_expert_bias=False,
-    keel=False,
-    keel_alpha=None,
     **overrides,
 ):
     """Seeded tiny eval-mode Apertus2ForCausalLM.
@@ -152,8 +136,6 @@ def build_tiny_model(
         sandwich_norm,
         moe_latent_size,
         use_quantile_balancing,
-        keel=keel,
-        keel_alpha=keel_alpha,
         **overrides,
     )
     model = Apertus2ForCausalLM(config)
@@ -302,15 +284,11 @@ def to_megatron_tensors(model, config=None, expert_bias_present=True):
         out[mg + "self_attention.linear_proj.weight"] = _grab(
             state_dict, hf + "self_attn.o_proj.weight"
         )
-        # Post-norms. sandwich_norm carries BOTH on every layer. KEEL carries post_self_attn only
-        # for L>=1 (the fork uses IdentityOp on the first layer, so the HF model has no
-        # post_attention_layernorm on layer 0) and post_mlp on ALL layers incl. layer 0.
-        keel = getattr(config, "keel", False)
-        if config.sandwich_norm or (keel and layer > 0):
+        if config.sandwich_norm:
             out[mg + "post_self_attn_layernorm.weight"] = _grab(
                 state_dict, hf + "post_attention_layernorm.weight"
             )
-        if config.sandwich_norm or keel:
+        if config.sandwich_norm:
             out[mg + "post_mlp_layernorm.weight"] = _grab(
                 state_dict, hf + "post_feedforward_layernorm.weight"
             )
@@ -499,10 +477,6 @@ def make_args_namespace(config, expert_bias_present=True, **overrides):
         scale_embeddings_by_sqrt_hidden=scale_embeddings,
         residual_output_scaling=residual_scaling,
         fp32_residual_connection=False,
-        # KEEL (highway Post-LN): fork spellings. keel_alpha carries the fork default (None ->
-        # 2*num_layers is applied by the model, so a real checkpoint may leave it None).
-        keel=bool(getattr(config, "keel", False)),
-        keel_alpha=getattr(config, "keel_alpha", None),
         # excluded fork features (must all be off/None for the exporter to proceed)
         multi_latent_attention=False,
         mtp_num_layers=None,

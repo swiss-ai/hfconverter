@@ -87,12 +87,8 @@ def derive_config(args):
     return Apertus2Config(**kwargs)
 
 
-def good_args(
-    sandwich=False, latent=None, qb=False, expert_bias=True, keel=False, keel_alpha=None, **overrides
-):
-    config = megatron_mock.tiny_export_config(
-        sandwich, latent, qb, keel=keel, keel_alpha=keel_alpha
-    )
+def good_args(sandwich=False, latent=None, qb=False, expert_bias=True, **overrides):
+    config = megatron_mock.tiny_export_config(sandwich, latent, qb)
     return megatron_mock.make_args_namespace(
         config, expert_bias_present=expert_bias, **overrides
     )
@@ -231,24 +227,6 @@ class TestDerivations:
                     moe_router_group_topk=None,
                 )
             )
-
-    def test_keel_off_by_default(self):
-        config = derive_config(good_args())
-        assert config.keel is False
-        assert config.keel_alpha is None
-
-    def test_keel_on_derives_and_threads_alpha(self):
-        # KEEL forbids residual scaling, so a keel config/namespace carries residual_multiplier 1.0
-        # (make_args_namespace derives residual_output_scaling=False from it).
-        config = derive_config(good_args(keel=True, keel_alpha=7.5))
-        assert config.keel is True
-        assert config.keel_alpha == 7.5
-        assert config.residual_multiplier == 1.0
-
-    def test_keel_on_with_default_alpha_none(self):
-        config = derive_config(good_args(keel=True))
-        assert config.keel is True
-        assert config.keel_alpha is None  # None -> the model applies the 2*num_layers default
 
     def test_multipliers_on_exact_floats(self):
         config = derive_config(good_args())
@@ -426,20 +404,14 @@ class TestUnsupportedRoutingModes:
             derive(good_args(moe_router_load_balancing_type=balancing))
 
 
-class TestKeelMutualExclusion:
-    """KEEL is supported, but the exporter refuses the two combinations the fork forbids, in the
-    early args-audit (a `_hard`) rather than deferring to the config constructor."""
+class TestUnsupportedResidualModes:
+    def test_keel_is_rejected(self):
+        with pytest.raises(ValueError, match="args.keel is falsy"):
+            derive(good_args(keel=True))
 
-    def test_keel_with_sandwich_norm_is_fatal(self):
-        # A checkpoint can carry at most one post-norm scheme; both together is ambiguous.
-        with pytest.raises(ValueError, match="sandwich_norm"):
-            derive(good_args(keel=True, sandwich_norm=True))
-
-    def test_keel_with_residual_output_scaling_is_fatal(self):
-        # The fork forbids --keel with --residual-output-scaling (KEEL carries the residual by
-        # keel_alpha instead), so a checkpoint claiming both is malformed.
-        with pytest.raises(ValueError, match="residual_output_scaling"):
-            derive(good_args(keel=True, residual_output_scaling=True))
+    def test_keel_alpha_is_rejected(self):
+        with pytest.raises(ValueError, match="args.keel_alpha is None"):
+            derive(good_args(keel_alpha=3.0))
 
 
 class TestRopeScaling:

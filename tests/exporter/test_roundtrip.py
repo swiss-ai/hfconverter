@@ -24,21 +24,18 @@ import megatron_mock  # noqa: E402
 from modeling_apertus2 import Apertus2ForCausalLM  # noqa: E402
 
 COMBO_PARAMS = [
-    pytest.param(sandwich, latent, qb, expert_bias, keel, id=combo_id)
-    for combo_id, sandwich, latent, qb, expert_bias, keel in megatron_mock.ROUNDTRIP_COMBOS
+    pytest.param(sandwich, latent, qb, expert_bias, id=combo_id)
+    for combo_id, sandwich, latent, qb, expert_bias in megatron_mock.ROUNDTRIP_COMBOS
 ]
 
 
-def _build_and_save(
-    tmp_path, sandwich, latent, qb, expert_bias, keel=False, seed=0, **model_overrides
-):
+def _build_and_save(tmp_path, sandwich, latent, qb, expert_bias, seed=0, **model_overrides):
     model = megatron_mock.build_tiny_model(
         sandwich,
         latent,
         qb,
         seed=seed,
         zero_expert_bias=not expert_bias,
-        keel=keel,
         **model_overrides,
     )
     tensors = megatron_mock.to_megatron_tensors(
@@ -64,13 +61,11 @@ def _assert_weight_files(output_dir):
 
 
 class TestRoundtrip:
-    @pytest.mark.parametrize("sandwich,latent,qb,expert_bias,keel", COMBO_PARAMS)
+    @pytest.mark.parametrize("sandwich,latent,qb,expert_bias", COMBO_PARAMS)
     def test_bitwise_roundtrip(
-        self, dist_env, export_api, tmp_path, sandwich, latent, qb, expert_bias, keel
+        self, dist_env, export_api, tmp_path, sandwich, latent, qb, expert_bias
     ):
-        model, checkpoint_dir = _build_and_save(
-            tmp_path, sandwich, latent, qb, expert_bias, keel=keel
-        )
+        model, checkpoint_dir = _build_and_save(tmp_path, sandwich, latent, qb, expert_bias)
         output_dir = tmp_path / "hf_export"
 
         export_api(checkpoint_dir, output_dir)
@@ -109,13 +104,12 @@ class TestRoundtrip:
             "AutoModelForCausalLM": "modeling_apertus2.Apertus2ForCausalLM",
         }
         assert saved["sandwich_norm"] is sandwich
-        assert saved["keel"] is keel
+        assert "keel" not in saved
+        assert "keel_alpha" not in saved
         assert saved["moe_latent_size"] == latent
         assert saved["use_quantile_balancing"] is qb
         assert saved["embedding_multiplier"] == megatron_mock.TINY_EMBEDDING_MULTIPLIER
-        # KEEL forbids residual scaling -> residual_multiplier is exactly 1.0 (not the tiny default)
-        expected_residual = 1.0 if keel else megatron_mock.TINY_RESIDUAL_MULTIPLIER
-        assert saved["residual_multiplier"] == expected_residual
+        assert saved["residual_multiplier"] == megatron_mock.TINY_RESIDUAL_MULTIPLIER
         assert saved["vocab_size"] == 128
         assert saved["hidden_size"] == 32
         assert saved["num_hidden_layers"] == 3
@@ -142,18 +136,6 @@ class TestRoundtrip:
         assert os.path.isfile(output_dir / "modeling_apertus2.py")
         assert os.path.isfile(output_dir / "conversion_info.json")
         _assert_weight_files(output_dir)
-
-        if keel:
-            # KEEL layer-0 asymmetry: the first layer has NO post_attention_layernorm (attention
-            # degrades to plain pre-norm), but post_feedforward_layernorm exists on ALL layers.
-            # Assert against the on-disk safetensors key set so it pins the export, not just the
-            # reloaded module (which would mask a missing key via from_pretrained defaults).
-            keys = set(restored_state)
-            assert "model.layers.0.post_attention_layernorm.weight" not in keys
-            assert "model.layers.0.post_feedforward_layernorm.weight" in keys
-            for layer_idx in range(1, saved["num_hidden_layers"]):
-                assert f"model.layers.{layer_idx}.post_attention_layernorm.weight" in keys
-                assert f"model.layers.{layer_idx}.post_feedforward_layernorm.weight" in keys
 
         if not expert_bias:
             # zero-synthesis path: buffers exist, are fp32 zeros, and the synthesis is

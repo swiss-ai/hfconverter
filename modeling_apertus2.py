@@ -18,7 +18,7 @@ The complete tensor journey is:
 1. Token ids become embeddings with shape ``[batch, sequence, hidden]``.
 2. Every decoder layer runs self-attention, then a dense MLP or a mixture of experts (MoE).
 3. Each block returns the same ``[batch, sequence, hidden]`` shape and updates the residual
-   stream.  Plain, sandwich-norm, and KEEL layers differ only in how that update is combined.
+   stream. Plain and sandwich-norm layers differ only in how that update is combined.
 4. A final RMSNorm produces hidden states; ``Apertus2ForCausalLM`` projects them to one score
    per vocabulary item.
 
@@ -509,22 +509,19 @@ class Apertus2MoE(nn.Module):
 class Apertus2DecoderLayer(GradientCheckpointingLayer):
     """One attention block followed by one dense or MoE feed-forward block.
 
-    Every input, branch output, and result has shape ``[B, S, H]``.  The layer supports three
+    Every input, branch output, and result has shape ``[B, S, H]``. The layer supports two
     residual rules, selected once by the config:
 
     - plain: ``x + residual_multiplier * branch(pre_norm(x))``;
-    - sandwich: ``x + residual_multiplier * post_norm(branch(pre_norm(x)))``;
-    - KEEL: ``post_norm(keel_alpha * x + branch(pre_norm(x)))``.
+    - sandwich: ``x + residual_multiplier * post_norm(branch(pre_norm(x)))``.
 
-    KEEL layer zero intentionally omits the attention post-norm and uses carry scale 1, matching
-    Megatron.  ``_merge_branch_with_residual`` is the single place implementing these formulas.
+    ``_merge_branch_with_residual`` is the single place implementing these formulas.
     """
 
     def __init__(self, config: Apertus2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.sandwich_norm = config.sandwich_norm
-        self.keel = config.keel
         self.residual_multiplier = config.residual_multiplier
 
         self.self_attn = Apertus2Attention(config=config, layer_idx=layer_idx)
@@ -544,15 +541,6 @@ class Apertus2DecoderLayer(GradientCheckpointingLayer):
         if config.sandwich_norm:
             self.post_attention_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.post_feedforward_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        elif self.keel:
-            self.keel_first_layer = layer_idx == 0
-            keel_alpha = (
-                config.keel_alpha if config.keel_alpha is not None else float(2 * config.num_hidden_layers)
-            )
-            self.keel_residual_scale = 1.0 if self.keel_first_layer else keel_alpha
-            if not self.keel_first_layer:
-                self.post_attention_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _merge_branch_with_residual(
         self,
@@ -561,12 +549,6 @@ class Apertus2DecoderLayer(GradientCheckpointingLayer):
         post_norm: nn.Module | None,
     ) -> torch.Tensor:
         """Apply the configured residual formula to one ``[B, S, H]`` branch output."""
-        if self.keel:
-            # KEEL normalizes after adding the branch.  ``post_norm is None`` is the intentional
-            # first-layer attention special case.
-            combined_states = self.keel_residual_scale * residual_stream + branch_output
-            return combined_states if post_norm is None else post_norm(combined_states)
-
         # Sandwich norm is applied before residual_multiplier.  RMSNorm would cancel most of a
         # multiplier applied before it, so this order is part of the checkpoint's model math.
         if post_norm is not None:
