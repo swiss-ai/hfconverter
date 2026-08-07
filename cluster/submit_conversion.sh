@@ -28,9 +28,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
 MEGATRON_PATH=${MEGATRON_PATH:-/iopsstor/scratch/cscs/${USER}/Megatron-LM-MoE}
 TOKENIZER_DIR=${TOKENIZER_DIR:-$MEGATRON_PATH/_research/data/apertus-mul-200k-tokenizer}
-STAGE1_ENV=${STAGE1_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+STAGE1_ENV=${STAGE1_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 TRUST_LEGACY_CHECKPOINT=${TRUST_LEGACY_CHECKPOINT:-0}
-HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 EXTRA_EXPORT_ARGS=${EXTRA_EXPORT_ARGS:-}
 LOG_DIR=${LOG_DIR:-$REPO/cluster/logs}
 

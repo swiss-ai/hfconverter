@@ -1,4 +1,4 @@
-# apertus-moe-hf container for Stage 1, Stage 2, and tests.
+# apertus2-hf container for Stage 1, Stage 2, and tests.
 # STAGE1_ENV and HF_ENV select the EDF that points at the built squashfs image.
 #
 #   fork side (Stage 1): jobs export

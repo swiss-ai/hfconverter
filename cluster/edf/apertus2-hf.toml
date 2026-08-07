@@ -10,7 +10,7 @@
 # ($FORK/_research/launch/alps3.toml): /capstor + /users + /iopsstor.
 # ${USER} is expanded from the host environment by the container engine.
 
-image = "/iopsstor/scratch/cscs/${USER}/images/apertus-moe-hf.sqsh"
+image = "/iopsstor/scratch/cscs/${USER}/images/apertus2-hf.sqsh"
 mounts = ["/capstor:/capstor", "/users:/users", "/iopsstor:/iopsstor"]
 workdir = "/iopsstor/scratch/cscs/${USER}/hfconverter"
 writable = true

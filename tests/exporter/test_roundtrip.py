@@ -21,7 +21,7 @@ import torch  # noqa: E402
 
 import exporter.export  # noqa: E402,F401  (module-level on purpose: collection surfaces the dependency)
 import megatron_mock  # noqa: E402
-from modeling_apertus_moe import ApertusMoeForCausalLM  # noqa: E402
+from modeling_apertus2 import Apertus2ForCausalLM  # noqa: E402
 
 COMBO_PARAMS = [
     pytest.param(sandwich, latent, qb, expert_bias, keel, id=combo_id)
@@ -76,7 +76,7 @@ class TestRoundtrip:
         export_api(checkpoint_dir, output_dir)
 
         # (a) loads with zero key issues
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(output_dir), dtype=torch.float32, output_loading_info=True
         )
         reloaded.eval()
@@ -99,14 +99,14 @@ class TestRoundtrip:
         # (c) config.json: flags, multipliers, geometry
         with open(output_dir / "config.json") as f:
             saved = json.load(f)
-        assert saved["model_type"] == "apertus_moe"
-        assert saved["architectures"] == ["ApertusMoeForCausalLM"]
+        assert saved["model_type"] == "apertus2"
+        assert saved["architectures"] == ["Apertus2ForCausalLM"]
         assert saved.get("auto_map") == {
-            "AutoConfig": "configuration_apertus_moe.ApertusMoeConfig",
+            "AutoConfig": "configuration_apertus2.Apertus2Config",
             # AutoModel too: a consumer that wants the BACKBONE rather than the LM head must be
             # able to call AutoModel.from_pretrained on the exported dir.
-            "AutoModel": "modeling_apertus_moe.ApertusMoeModel",
-            "AutoModelForCausalLM": "modeling_apertus_moe.ApertusMoeForCausalLM",
+            "AutoModel": "modeling_apertus2.Apertus2Model",
+            "AutoModelForCausalLM": "modeling_apertus2.Apertus2ForCausalLM",
         }
         assert saved["sandwich_norm"] is sandwich
         assert saved["keel"] is keel
@@ -138,8 +138,8 @@ class TestRoundtrip:
         assert (saved.get("dtype") or saved.get("torch_dtype")) == "float32"
 
         # The exported directory is self-contained.
-        assert os.path.isfile(output_dir / "configuration_apertus_moe.py")
-        assert os.path.isfile(output_dir / "modeling_apertus_moe.py")
+        assert os.path.isfile(output_dir / "configuration_apertus2.py")
+        assert os.path.isfile(output_dir / "modeling_apertus2.py")
         assert os.path.isfile(output_dir / "conversion_info.json")
         _assert_weight_files(output_dir)
 
@@ -182,7 +182,7 @@ class TestRoundtrip:
         output_dir = tmp_path / "hf_interleaved"
         export_api(checkpoint_dir, output_dir)
 
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(output_dir), dtype=torch.float32, output_loading_info=True
         )
         assert not any(info.values()), info
@@ -239,11 +239,11 @@ class TestRoundtrip:
         )
         assert os.path.isfile(output_dir / "config.json")
         assert os.path.isfile(output_dir / "conversion_info.json")
-        assert os.path.isfile(output_dir / "configuration_apertus_moe.py")
-        assert os.path.isfile(output_dir / "modeling_apertus_moe.py")
+        assert os.path.isfile(output_dir / "configuration_apertus2.py")
+        assert os.path.isfile(output_dir / "modeling_apertus2.py")
         _assert_weight_files(output_dir)
         # and the CLI output actually loads back bitwise
-        reloaded = ApertusMoeForCausalLM.from_pretrained(str(output_dir), dtype=torch.float32)
+        reloaded = Apertus2ForCausalLM.from_pretrained(str(output_dir), dtype=torch.float32)
         source_state = model.state_dict()
         restored_state = reloaded.state_dict()
         assert set(source_state) == set(restored_state)

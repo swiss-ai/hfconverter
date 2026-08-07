@@ -73,13 +73,13 @@ def tiny_export_config(
     keel_alpha=None,
     **overrides,
 ):
-    """ApertusMoeConfig at the frozen tiny geometry, exporter-consistent multipliers.
+    """Apertus2Config at the frozen tiny geometry, exporter-consistent multipliers.
 
     KEEL forbids residual scaling (the fork refuses --keel with --residual-output-scaling; the
     config guards residual_multiplier != 1.0), so a keel config carries residual_multiplier == 1.0
     instead of the usual tiny 1/sqrt(2*num_layers). Mutually exclusive with sandwich_norm.
     """
-    from configuration_apertus_moe import ApertusMoeConfig
+    from configuration_apertus2 import Apertus2Config
 
     # KEEL carries the residual by keel_alpha, not by a fixed multiplier -> residual_multiplier 1.0
     residual_multiplier = 1.0 if keel else TINY_RESIDUAL_MULTIPLIER
@@ -123,7 +123,7 @@ def tiny_export_config(
         use_cache=True,
     )
     kwargs.update(overrides)
-    return ApertusMoeConfig(**kwargs)
+    return Apertus2Config(**kwargs)
 
 
 def build_tiny_model(
@@ -137,7 +137,7 @@ def build_tiny_model(
     keel_alpha=None,
     **overrides,
 ):
-    """Seeded tiny eval-mode ApertusMoeForCausalLM.
+    """Seeded tiny eval-mode Apertus2ForCausalLM.
 
     randomize_router_buffers: fills the fp32 router buffers with non-zero seeded values so a
     fidelity test actually distinguishes "copied" from "synthesized zeros" (the class inits
@@ -145,7 +145,7 @@ def build_tiny_model(
     e_score_correction_bias at zeros — required by the expert_bias-absent roundtrip combo,
     where the exporter synthesizes fp32 zeros and the comparison target must equal them.
     """
-    from modeling_apertus_moe import ApertusMoeForCausalLM
+    from modeling_apertus2 import Apertus2ForCausalLM
 
     torch.manual_seed(seed)
     config = tiny_export_config(
@@ -156,7 +156,7 @@ def build_tiny_model(
         keel_alpha=keel_alpha,
         **overrides,
     )
-    model = ApertusMoeForCausalLM(config)
+    model = Apertus2ForCausalLM(config)
     model.eval()
     if randomize_router_buffers:
         generator = torch.Generator().manual_seed(seed + 999)
@@ -255,7 +255,7 @@ def _grab(state_dict, key):
 
 
 def to_megatron_tensors(model, config=None, expert_bias_present=True):
-    """ApertusMoeForCausalLM (or its runtime state dict) -> fork-keyed {str: Tensor}.
+    """Apertus2ForCausalLM (or its runtime state dict) -> fork-keyed {str: Tensor}.
 
     Key renames follow the production mapping in reverse. FP32 router buffers stay
     fp32. e_score_correction_bias maps to router.expert_bias only when expert_bias_present;

@@ -9,7 +9,7 @@ here imports megatron at module level. Every test module in this directory start
 
 PARENT-CONFTEST RE-EXPORT SHIELD (load-bearing, do not remove): pytest imports every
 conftest.py under the bare module name 'conftest', and the last one imported owns
-sys.modules['conftest']. The existing tests/test_modeling_apertus_moe.py does
+sys.modules['conftest']. The existing tests/test_modeling_apertus2.py does
 `from conftest import EMBEDDING_MULTIPLIER, ...`; once THIS file exists it can be the module
 that import resolves to (verified on pytest 9.1.1). We therefore load the parent
 tests/conftest.py under an explicit private name and re-export all of its public names, so
@@ -79,7 +79,7 @@ def dist_env():
 
 @pytest.fixture
 def make_export_config():
-    """Factory for tiny ApertusMoeConfig over the {sandwich} x {latent} x {QB} matrix."""
+    """Factory for tiny Apertus2Config over the {sandwich} x {latent} x {QB} matrix."""
 
     def _make(
         sandwich_norm=False, moe_latent_size=None, use_quantile_balancing=False, **overrides
@@ -93,7 +93,7 @@ def make_export_config():
 
 @pytest.fixture
 def make_export_model():
-    """Factory for a tiny, seeded, eval-mode ApertusMoeForCausalLM with non-zero fp32
+    """Factory for a tiny, seeded, eval-mode Apertus2ForCausalLM with non-zero fp32
     router buffers (so copy-vs-synthesize bugs are observable)."""
 
     def _make(

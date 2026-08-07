@@ -51,8 +51,8 @@ NORM_EPSILON=${NORM_EPSILON:-1e-5}
 SANDWICH_NORM=${SANDWICH_NORM:-0}
 MEGATRON_PATH=${MEGATRON_PATH:-/iopsstor/scratch/cscs/${USER}/Megatron-LM-MoE}
 # Pyxis consumes an EDF file, not the cluster/container source directory.  The
-# repository EDF points at the already-built images/apertus-moe-hf.sqsh image.
-STAGE1_ENV=${STAGE1_ENV:-/iopsstor/scratch/cscs/${USER}/hfconverter/cluster/edf/apertus-moe-hf.toml}
+# repository EDF points at the already-built images/apertus2-hf.sqsh image.
+STAGE1_ENV=${STAGE1_ENV:-/iopsstor/scratch/cscs/${USER}/hfconverter/cluster/edf/apertus2-hf.toml}
 TRUST_LEGACY_CHECKPOINT=${TRUST_LEGACY_CHECKPOINT:-0}
 
 for topology_name in SRC_TP SRC_PP SRC_EP SRC_ETP SRC_CP; do

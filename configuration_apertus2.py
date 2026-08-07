@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Configuration for the Apertus-2 mixture-of-experts language model.
+"""Configuration for the Apertus 2 mixture-of-experts language model.
 
 This file describes *which* model to build; tensor operations live in
-``modeling_apertus_moe.py``.  The most important choices are documented on
-``ApertusMoeConfig`` so a saved ``config.json`` remains understandable on its own.
+``modeling_apertus2.py``.  The most important choices are documented on
+``Apertus2Config`` so a saved ``config.json`` remains understandable on its own.
 """
 
 from huggingface_hub.dataclasses import strict
@@ -25,9 +25,9 @@ from transformers.modeling_rope_utils import RopeParameters
 
 
 @strict
-class ApertusMoeConfig(PreTrainedConfig):
+class Apertus2Config(PreTrainedConfig):
     r"""
-    Settings used by :class:`ApertusMoeModel` and :class:`ApertusMoeForCausalLM`.
+    Settings used by :class:`Apertus2Model` and :class:`Apertus2ForCausalLM`.
 
     A decoder layer always has attention followed by a feed-forward block.  ``moe_layer_freq``
     optionally marks every layer as dense (``0``) or MoE (``1``).  Older configs without that
@@ -63,11 +63,11 @@ class ApertusMoeConfig(PreTrainedConfig):
     coupling them here would bake in an assumption a checkpoint only happens to satisfy.
 
     Parameter names intentionally match the exported checkpoints. See
-    ``modeling_apertus_moe`` for shape-by-shape docstrings and ``exporter/README.md`` for the
+    ``modeling_apertus2`` for shape-by-shape docstrings and ``exporter/README.md`` for the
     conversion layout.
     """
 
-    model_type = "apertus_moe"
+    model_type = "apertus2"
     keys_to_ignore_at_inference = ["past_key_values"]
     default_theta = 500000.0
 
@@ -155,7 +155,7 @@ class ApertusMoeConfig(PreTrainedConfig):
         """Keep settings that are fixed by the Apertus checkpoint format."""
         if self.tie_word_embeddings:
             raise ValueError(
-                "ApertusMoe is untied (--untie-embeddings-and-output-weights): "
+                "Apertus2 is untied (--untie-embeddings-and-output-weights): "
                 "tie_word_embeddings=True is not supported and would silently do nothing."
             )
 
@@ -287,14 +287,14 @@ class ApertusMoeConfig(PreTrainedConfig):
         explicit_prf = kwargs.get("partial_rotary_factor")
         if explicit_prf is not None and explicit_prf != 1.0:
             raise ValueError(
-                f"ApertusMoe uses full rotary embeddings; got explicit partial_rotary_factor="
+                f"Apertus2 uses full rotary embeddings; got explicit partial_rotary_factor="
                 f"{explicit_prf}. Only 1.0 is supported (omit it to default to 1.0)."
             )
         if isinstance(self.rope_parameters, dict):
             prf_in_dict = self.rope_parameters.get("partial_rotary_factor")
             if prf_in_dict is not None and prf_in_dict != 1.0:
                 raise ValueError(
-                    f"ApertusMoe uses full rotary embeddings; got rope_parameters['partial_rotary"
+                    f"Apertus2 uses full rotary embeddings; got rope_parameters['partial_rotary"
                     f"_factor']={prf_in_dict}. Only 1.0 is supported (omit it to default to 1.0)."
                 )
         if self.rope_parameters is None:
@@ -310,10 +310,10 @@ class ApertusMoeConfig(PreTrainedConfig):
 
 
 # Import-time, load-bearing for trust_remote_code artifacts: sets _auto_class so that
-# save_pretrained writes auto_map = {"AutoConfig": "configuration_apertus_moe.ApertusMoeConfig"}
+# save_pretrained writes auto_map = {"AutoConfig": "configuration_apertus2.Apertus2Config"}
 # into config.json and copies this file into the save directory, making the saved dir
 # self-describing for AutoConfig.from_pretrained(..., trust_remote_code=True).
-ApertusMoeConfig.register_for_auto_class("AutoConfig")
+Apertus2Config.register_for_auto_class("AutoConfig")
 
 
-__all__ = ["ApertusMoeConfig"]
+__all__ = ["Apertus2Config"]

@@ -431,7 +431,7 @@ def export_checkpoint(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m exporter.export",
-        description="Apertus-2 MoE Megatron torch_dist checkpoint -> "
+        description="Apertus 2 MoE Megatron torch_dist checkpoint -> "
                     "Hugging Face safetensors directory (trust_remote_code).",
     )
     parser.add_argument("--checkpoint-dir", required=True,

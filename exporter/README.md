@@ -112,7 +112,7 @@ summary = export_checkpoint(
 
 ## Supported checkpoint features
 
-The current config and mapping support the Apertus MoE variants exercised by
+The current config and mapping support the Apertus 2 variants exercised by
 the test suite and production export, including:
 
 - SwiGLU and SSSGLU;

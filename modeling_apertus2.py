@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Readable Hugging Face implementation of the Apertus-2 MoE decoder.
+"""Readable Hugging Face implementation of the Apertus 2 MoE decoder.
 
 The complete tensor journey is:
 
@@ -19,7 +19,7 @@ The complete tensor journey is:
 2. Every decoder layer runs self-attention, then a dense MLP or a mixture of experts (MoE).
 3. Each block returns the same ``[batch, sequence, hidden]`` shape and updates the residual
    stream.  Plain, sandwich-norm, and KEEL layers differ only in how that update is combined.
-4. A final RMSNorm produces hidden states; ``ApertusMoeForCausalLM`` projects them to one score
+4. A final RMSNorm produces hidden states; ``Apertus2ForCausalLM`` projects them to one score
    per vocabulary item.
 
 For MoE layers, the router chooses ``top_k`` experts independently for every token.  Routed
@@ -66,21 +66,21 @@ from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
 
 try:
-    from .configuration_apertus_moe import ApertusMoeConfig
+    from .configuration_apertus2 import Apertus2Config
 except ImportError:
-    from configuration_apertus_moe import ApertusMoeConfig
+    from configuration_apertus2 import Apertus2Config
 
 
 # Checkpoint conversion between per-expert and stacked expert layouts.
 # Megatron saves one key per expert, while this runtime stores all experts in two stacked 3-D
 # tensors.  This import-time registration teaches Transformers how to convert between layouts.
-if get_checkpoint_conversion_mapping("apertus_moe") is None:
+if get_checkpoint_conversion_mapping("apertus2") is None:
     # Keep a private list because Transformers' registry stores the object it receives.
-    register_checkpoint_conversion_mapping("apertus_moe", list(get_checkpoint_conversion_mapping("qwen2_moe")))
+    register_checkpoint_conversion_mapping("apertus2", list(get_checkpoint_conversion_mapping("qwen2_moe")))
 
 
 # Activation functions.
-class ApertusMoeSSSGLU(nn.Module):
+class Apertus2SSSGLU(nn.Module):
     """Megatron's ``sssglu`` gate: a shifted, recentred softsign.
 
     ``gate(x) = softsign(x - 1) + 0.5``, so ``gate(1) = 0.5`` and the output spans
@@ -96,7 +96,7 @@ class ApertusMoeSSSGLU(nn.Module):
 # Activations Transformers does not ship, keyed exactly like ``ACT2FN`` so ``config.hidden_act``
 # stays a plain string in config.json.  A local table is used instead of inserting into ACT2FN,
 # because a trust_remote_code file must not mutate library globals for the whole process.
-_APERTUS_ACT2CLS: dict[str, type[nn.Module]] = {"sssglu": ApertusMoeSSSGLU}
+_APERTUS_ACT2CLS: dict[str, type[nn.Module]] = {"sssglu": Apertus2SSSGLU}
 
 
 def resolve_activation(name: str) -> nn.Module:
@@ -161,7 +161,7 @@ def eager_attention_forward(
 
 # Self-attention.
 @use_kernelized_func(apply_rotary_pos_emb)
-class ApertusMoeAttention(nn.Module):
+class Apertus2Attention(nn.Module):
     """Grouped-query self-attention with RMSNorm applied separately to every Q/K head.
 
     A projection first turns ``[B, S, H]`` into query ``[B, S, Q, D]`` and key/value
@@ -175,7 +175,7 @@ class ApertusMoeAttention(nn.Module):
     because the flash-attention path carries the window in that keyword and nowhere else.
     """
 
-    def __init__(self, config: ApertusMoeConfig, layer_idx: int | None = None):
+    def __init__(self, config: Apertus2Config, layer_idx: int | None = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -203,8 +203,8 @@ class ApertusMoeAttention(nn.Module):
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         self.use_qk_norm = config.use_qk_norm
         if self.use_qk_norm:
-            self.q_norm = ApertusMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = ApertusMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.q_norm = Apertus2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Apertus2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -265,7 +265,7 @@ class ApertusMoeAttention(nn.Module):
 
 
 # Dense gated MLP.
-class ApertusMoeMLP(nn.Module):
+class Apertus2MLP(nn.Module):
     """A gated feed-forward block used by dense layers and the shared expert.
 
     For every token: ``[H] -> gate/up [intermediate] -> elementwise product -> [H]``.
@@ -288,19 +288,19 @@ class ApertusMoeMLP(nn.Module):
 
 
 # Router logits and top-k selection.
-class ApertusMoeTopkRouter(nn.Module):
+class Apertus2TopkRouter(nn.Module):
     """Score every routed expert and choose ``top_k`` experts for every token.
 
     ``[B, S, H]`` is flattened to ``[B * S, H]`` and projected with an ``[E, H]`` weight in
     float32, producing raw logits ``[B * S, E]``.  Selection lives here (not in
-    ``ApertusMoeMoE``) so ``forward`` returns the triple Transformers' expert parallelism
+    ``Apertus2MoE``) so ``forward`` returns the triple Transformers' expert parallelism
     expects from a gate: ``(router_logits, top_k_weights, top_k_indices)``.  Under EP the
     ``ep_router`` plan entry rewrites that pair per rank — non-local weights become zero and
     non-local indices become the sentinel ``num_local_experts`` — and reads ``num_experts``
     from this module, so that attribute name is part of the contract.
     """
 
-    def __init__(self, config: ApertusMoeConfig):
+    def __init__(self, config: Apertus2Config):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
@@ -382,7 +382,7 @@ class ApertusMoeTopkRouter(nn.Module):
 
 # RMSNorm.
 @use_kernel_forward_from_hub("RMSNorm")
-class ApertusMoeRMSNorm(nn.Module):
+class Apertus2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
         """Normalize each token by its root-mean-square over the final feature axis."""
         super().__init__()
@@ -402,7 +402,7 @@ class ApertusMoeRMSNorm(nn.Module):
 
 # Routed experts.
 @use_experts_implementation
-class ApertusMoeNaiveMoe(nn.Module):
+class Apertus2NaiveMoe(nn.Module):
     """Apply only the experts selected for each token, then sum their weighted outputs.
 
     The input is ``[tokens, expert_input_dim]``.  ``top_k_index`` and ``top_k_weights`` are both
@@ -456,7 +456,7 @@ class ApertusMoeNaiveMoe(nn.Module):
 
 
 # Complete MoE block; selection lives on the router.
-class ApertusMoeMoE(nn.Module):
+class Apertus2MoE(nn.Module):
     """Combine token-routed experts with one shared expert path.
 
     The order is deliberately explicit because LatentMoE has two parallel paths::
@@ -473,9 +473,9 @@ class ApertusMoeMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.experts = ApertusMoeNaiveMoe(config)
-        self.gate = ApertusMoeTopkRouter(config)
-        self.shared_experts = ApertusMoeMLP(
+        self.experts = Apertus2NaiveMoe(config)
+        self.gate = Apertus2TopkRouter(config)
+        self.shared_experts = Apertus2MLP(
             config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
         )
         self.moe_latent_size = config.moe_latent_size
@@ -506,7 +506,7 @@ class ApertusMoeMoE(nn.Module):
 
 
 # Decoder layer.
-class ApertusMoeDecoderLayer(GradientCheckpointingLayer):
+class Apertus2DecoderLayer(GradientCheckpointingLayer):
     """One attention block followed by one dense or MoE feed-forward block.
 
     Every input, branch output, and result has shape ``[B, S, H]``.  The layer supports three
@@ -520,30 +520,30 @@ class ApertusMoeDecoderLayer(GradientCheckpointingLayer):
     Megatron.  ``_merge_branch_with_residual`` is the single place implementing these formulas.
     """
 
-    def __init__(self, config: ApertusMoeConfig, layer_idx: int):
+    def __init__(self, config: Apertus2Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.sandwich_norm = config.sandwich_norm
         self.keel = config.keel
         self.residual_multiplier = config.residual_multiplier
 
-        self.self_attn = ApertusMoeAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = Apertus2Attention(config=config, layer_idx=layer_idx)
 
         if config.is_moe_layer(layer_idx):
-            self.mlp = ApertusMoeMoE(config)
+            self.mlp = Apertus2MoE(config)
         else:
-            self.mlp = ApertusMoeMLP(config)
+            self.mlp = Apertus2MLP(config)
 
         # Checkpoint naming differs from Llama/GLM: feedforward_layernorm is the MLP pre-norm;
         # post_attention_layernorm really is the attention post-norm.
-        self.attention_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.feedforward_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.feedforward_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # Absent modules stay absent rather than becoming Identity placeholders.  This keeps
         # state-dict keys an exact description of the architecture.
         if config.sandwich_norm:
-            self.post_attention_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         elif self.keel:
             self.keel_first_layer = layer_idx == 0
             keel_alpha = (
@@ -551,8 +551,8 @@ class ApertusMoeDecoderLayer(GradientCheckpointingLayer):
             )
             self.keel_residual_scale = 1.0 if self.keel_first_layer else keel_alpha
             if not self.keel_first_layer:
-                self.post_attention_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.post_attention_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_feedforward_layernorm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _merge_branch_with_residual(
         self,
@@ -630,13 +630,13 @@ class ApertusMoeDecoderLayer(GradientCheckpointingLayer):
 
 # Transformers integration and initialization
 # Model integration hooks.
-class ApertusMoePreTrainedModel(PreTrainedModel):
+class Apertus2PreTrainedModel(PreTrainedModel):
     """Shared Transformers hooks for loading, attention backends, and weight initialization."""
 
-    config: ApertusMoeConfig
+    config: Apertus2Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["ApertusMoeDecoderLayer"]
+    _no_split_modules = ["Apertus2DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
@@ -645,8 +645,8 @@ class ApertusMoePreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
-        "hidden_states": ApertusMoeDecoderLayer,
-        "attentions": ApertusMoeAttention,
+        "hidden_states": Apertus2DecoderLayer,
+        "attentions": Apertus2Attention,
     }
     # Router offsets must survive low-precision checkpoint loading in float32.
     _keep_in_fp32_modules_strict = ["e_score_correction_bias", "qb_beta"]
@@ -666,7 +666,7 @@ class ApertusMoePreTrainedModel(PreTrainedModel):
         if distributed_config is not None and distributed_config.enable_expert_parallel:
             return
         raise ValueError(
-            f"ApertusMoe supports only TP=1 for now (got tp_size={self.tp_size}); "
+            f"Apertus2 supports only TP=1 for now (got tp_size={self.tp_size}); "
             "load the model without tp_plan/tp_size, or use expert parallelism via "
             "distributed_config=DistributedConfig(enable_expert_parallel=True)."
         )
@@ -676,30 +676,30 @@ class ApertusMoePreTrainedModel(PreTrainedModel):
         # Transformers initializes normal Linear/Embedding/RMSNorm modules.
         super()._init_weights(module)
         # The router and stacked expert parameters are raw nn.Parameters, so initialize them here.
-        if isinstance(module, ApertusMoeTopkRouter):
+        if isinstance(module, Apertus2TopkRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             init.zeros_(module.e_score_correction_bias)
             if getattr(module, "qb_beta", None) is not None:  # QB only (buffer absent otherwise)
                 init.zeros_(module.qb_beta)
-        elif isinstance(module, ApertusMoeNaiveMoe):
+        elif isinstance(module, Apertus2NaiveMoe):
             init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
 # Base decoder model.
-class ApertusMoeModel(ApertusMoePreTrainedModel):
+class Apertus2Model(Apertus2PreTrainedModel):
     """Map token ids to contextual hidden states of shape ``[B, S, H]``."""
 
-    def __init__(self, config: ApertusMoeConfig):
+    def __init__(self, config: Apertus2Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [ApertusMoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [Apertus2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = ApertusMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in config.layer_types
         self.gradient_checkpointing = False
@@ -776,14 +776,14 @@ class ApertusMoeModel(ApertusMoePreTrainedModel):
 
 
 # Causal language-model head.
-class ApertusMoeForCausalLM(ApertusMoePreTrainedModel, GenerationMixin):
+class Apertus2ForCausalLM(Apertus2PreTrainedModel, GenerationMixin):
     """Add an untied vocabulary projection and optional next-token loss to the decoder."""
 
     # Untied (--untie-embeddings-and-output-weights); lm_head has its own parameter.
     _tied_weights_keys = {}
     def __init__(self, config):
         super().__init__(config)
-        self.model = ApertusMoeModel(config)
+        self.model = Apertus2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -838,11 +838,11 @@ class ApertusMoeForCausalLM(ApertusMoePreTrainedModel, GenerationMixin):
 
 # This import-time registration makes save_pretrained copy this implementation and lets
 # AutoModelForCausalLM reload the directory with trust_remote_code=True.
-ApertusMoeForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+Apertus2ForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 # The bare decoder is registered too, so a saved directory also serves consumers that want the
 # BACKBONE rather than the LM head. Without this, AutoModel.from_pretrained on an exported dir
 # raises "Unrecognized configuration class ... for this kind of AutoModel".
-ApertusMoeModel.register_for_auto_class("AutoModel")
+Apertus2Model.register_for_auto_class("AutoModel")
 
 
-__all__ = ["ApertusMoePreTrainedModel", "ApertusMoeModel", "ApertusMoeForCausalLM"]
+__all__ = ["Apertus2PreTrainedModel", "Apertus2Model", "Apertus2ForCausalLM"]

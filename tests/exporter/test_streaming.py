@@ -25,7 +25,7 @@ from safetensors.torch import load_file  # noqa: E402
 import megatron_mock  # noqa: E402
 from exporter import config_from_args, mapping, reader, writer  # noqa: E402
 from exporter.export import export_checkpoint  # noqa: E402
-from modeling_apertus_moe import ApertusMoeForCausalLM  # noqa: E402
+from modeling_apertus2 import Apertus2ForCausalLM  # noqa: E402
 
 # small enough to force many shards on the tiny model: the expert fc1 stack (one source) fans out
 # into 2*E per-expert tensors that land across several shards (straddling), and the 16 KB embedding
@@ -112,7 +112,7 @@ class TestStreamingMultiShardBitwise:
         assert summary.num_tensors == len(written)
 
         # the whole point: a straddled export loads back bitwise-identical to the source model
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(out_dir), dtype=torch.float32, output_loading_info=True
         )
         assert not info["missing_keys"], info["missing_keys"]

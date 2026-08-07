@@ -47,7 +47,7 @@ from .mapping import HFTensorSpec, SynthesizedTensor
 
 # export must work when the repo root is not the cwd: resolve it from __file__ and put it on
 # sys.path before importing the configuration/modeling modules (modeling falls back to a
-# top-level `from configuration_apertus_moe import ...`).
+# top-level `from configuration_apertus2 import ...`).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
@@ -55,7 +55,7 @@ SAFETENSORS_SINGLE_NAME = "model.safetensors"
 # huggingface_hub's SAFETENSORS_WEIGHTS_FILE_PATTERN: single shard -> "model.safetensors"; sharded
 # -> "model-00001-of-00005.safetensors". Passed to the packer so filenames match the torch path.
 SHARD_FILENAME_PATTERN = "model{suffix}.safetensors"
-_MODULE_FILES = ("configuration_apertus_moe.py", "modeling_apertus_moe.py")
+_MODULE_FILES = ("configuration_apertus2.py", "modeling_apertus2.py")
 _TOKENIZER_GLOBS = (
     "tokenizer*",
     "special_tokens_map.json",
@@ -150,31 +150,31 @@ def write_config(
     params_dtype: torch.dtype,
     token_ids: dict[str, int] | None = None,
 ) -> None:
-    """Build ``ApertusMoeConfig`` from checkpoint-derived values and save ``config.json``.
+    """Build ``Apertus2Config`` from checkpoint-derived values and save ``config.json``.
 
     ``token_ids`` (from the tokenizer, when one was supplied) is folded in HERE, not only into
     generation_config.json: otherwise the two files in the same exported directory disagree and
-    config.json silently ships the ApertusMoeConfig class defaults.
+    config.json silently ships the Apertus2Config class defaults.
     """
-    configuration = import_repo_module("configuration_apertus_moe")
+    configuration = import_repo_module("configuration_apertus2")
     if token_ids:
         cfg_kwargs = {**cfg_kwargs, **token_ids}
     else:
         logger.warning(
-            "no --tokenizer-dir given: config.json keeps the ApertusMoeConfig DEFAULT token ids "
+            "no --tokenizer-dir given: config.json keeps the Apertus2Config DEFAULT token ids "
             "(bos/eos/pad). Verify them against the training tokenizer before using this model."
         )
-    config = configuration.ApertusMoeConfig(**cfg_kwargs)
-    config.architectures = ["ApertusMoeForCausalLM"]
+    config = configuration.Apertus2Config(**cfg_kwargs)
+    config.architectures = ["Apertus2ForCausalLM"]
     # AutoModel is listed as well as AutoModelForCausalLM: without it,
     # AutoModel.from_pretrained(dir, trust_remote_code=True) raises "Unrecognized configuration
     # class ... for this kind of AutoModel" and any recipient whose tooling loads the BACKBONE
     # (embeddings, feature extraction, a custom head) is stuck, even though the class exists and
     # is exported. Found on the chonk-SWA export, which shipped without it.
     config.auto_map = {
-        "AutoConfig": "configuration_apertus_moe.ApertusMoeConfig",
-        "AutoModel": "modeling_apertus_moe.ApertusMoeModel",
-        "AutoModelForCausalLM": "modeling_apertus_moe.ApertusMoeForCausalLM",
+        "AutoConfig": "configuration_apertus2.Apertus2Config",
+        "AutoModel": "modeling_apertus2.Apertus2Model",
+        "AutoModelForCausalLM": "modeling_apertus2.Apertus2ForCausalLM",
     }
     # The embedding tensor determines the main parameter dtype; fp32 router buffers are exceptions.
     config.dtype = str(params_dtype).removeprefix("torch.")
@@ -395,8 +395,8 @@ def verify_from_pretrained(
     The HF runtime fuses expert matrices into 3D parameters, while its on-disk format uses one key
     per expert. The two expert branches below bridge that intentional representation difference.
     """
-    modeling = import_repo_module("modeling_apertus_moe")
-    model, loading_info = modeling.ApertusMoeForCausalLM.from_pretrained(
+    modeling = import_repo_module("modeling_apertus2")
+    model, loading_info = modeling.Apertus2ForCausalLM.from_pretrained(
         str(out_dir), dtype="auto", output_loading_info=True
     )
     problems = {k: v for k, v in loading_info.items() if v}

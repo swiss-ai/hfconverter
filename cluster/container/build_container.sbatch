@@ -39,7 +39,7 @@
 #   # knobs: SQSH_OUT=... REPO=... IMAGE_TAG=... MEGATRON_PATH=...
 # =============================================================================
 
-#SBATCH --job-name=apertus-moe-hf-container
+#SBATCH --job-name=apertus2-hf-container
 #SBATCH --time=01:20:00
 #SBATCH --partition=debug
 #SBATCH --nodes=1
@@ -57,8 +57,8 @@ echo "START TIME: $(date)"
 
 # ---- knobs ------------------------------------------------------------------
 REPO=${REPO:-/iopsstor/scratch/cscs/$USER/hfconverter}
-IMAGE_TAG=${IMAGE_TAG:-apertus-moe-hf:latest}
-SQSH_OUT=${SQSH_OUT:-/iopsstor/scratch/cscs/$USER/images/apertus-moe-hf.sqsh}
+IMAGE_TAG=${IMAGE_TAG:-apertus2-hf:latest}
+SQSH_OUT=${SQSH_OUT:-/iopsstor/scratch/cscs/$USER/images/apertus2-hf.sqsh}
 CONTAINERFILE=$REPO/cluster/container/Containerfile
 # PYTHONPATH the fork-personality smoke (step 4) tests: the live fork checkout
 # on scratch (no fork copy is baked into the image — jobs shadow pip mcore with
@@ -141,7 +141,7 @@ ls -lh "$SQSH_OUT"
 # lands on the same node that just wrote the file. $SQSH_OUT it points at is on
 # Lustre and is already moved into place above, so a smoke failure never costs
 # the image — only the verdict on it.
-SMOKE_EDF=$TMPDIR/apertus-moe-hf-smoke-$SLURM_JOB_ID.toml
+SMOKE_EDF=$TMPDIR/apertus2-hf-smoke-$SLURM_JOB_ID.toml
 cat > "$SMOKE_EDF" <<EOF
 image = "$SQSH_OUT"
 mounts = ["/capstor:/capstor", "/users:/users", "/iopsstor:/iopsstor"]
@@ -190,7 +190,7 @@ rm -f "$SMOKE_EDF" "$FORK_SMOKE_PY"
 
 echo
 echo "CONTAINER READY : $SQSH_OUT"
-echo "Referenced by   : $REPO/cluster/edf/apertus-moe-hf.toml"
+echo "Referenced by   : $REPO/cluster/edf/apertus2-hf.toml"
 echo "HF side next    : sbatch $REPO/cluster/tests.sbatch   # full suite, expect 0 skipped"
 echo "fork-side smoke : ready for Stage 1"
 echo "END TIME: $(date)"

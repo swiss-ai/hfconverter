@@ -54,7 +54,7 @@
 # --allow-no-verify-load, which it is given automatically).
 # =============================================================================
 
-#SBATCH --job-name=apertus-moe-stage2
+#SBATCH --job-name=apertus2-stage2
 #SBATCH --time=00:45:00
 #SBATCH --partition=debug
 #SBATCH --nodes=1
@@ -71,7 +71,7 @@ echo "START TIME: $(date)"
 
 REPO=${REPO:-/iopsstor/scratch/cscs/$USER/hfconverter}
 FORK=${FORK:-/iopsstor/scratch/cscs/$USER/Megatron-LM-MoE}
-HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 # TOKENIZER_DIR may be set empty on purpose (a tiny test fixture has no HF
 # tokenizer) — distinguish unset (default to the real one) from set-empty.
 TOKENIZER_DIR=${TOKENIZER_DIR-$FORK/_research/data/apertus-mul-200k-tokenizer}

@@ -1,4 +1,4 @@
-"""Acceptance tests for the custom Hugging Face Apertus MoE implementation."""
+"""Acceptance tests for the custom Hugging Face Apertus 2 implementation."""
 
 import glob
 import json
@@ -11,12 +11,12 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 
-from configuration_apertus_moe import ApertusMoeConfig
-from modeling_apertus_moe import (
-    ApertusMoeForCausalLM,
-    ApertusMoeMLP,
-    ApertusMoeMoE,
-    ApertusMoeRMSNorm,
+from configuration_apertus2 import Apertus2Config
+from modeling_apertus2 import (
+    Apertus2ForCausalLM,
+    Apertus2MLP,
+    Apertus2MoE,
+    Apertus2RMSNorm,
     resolve_activation,
 )
 from conftest import (
@@ -179,8 +179,8 @@ def _moe_layers(model):
 
 class TestContractPlumbing:
     def test_config_defaults_match_contract(self):
-        cfg = ApertusMoeConfig()
-        assert cfg.model_type == "apertus_moe"
+        cfg = Apertus2Config()
+        assert cfg.model_type == "apertus2"
         assert cfg.vocab_size == 200064  # exactly 1563*128, zero padding
         assert cfg.hidden_size == 768
         assert cfg.intermediate_size == 1920
@@ -214,17 +214,17 @@ class TestContractPlumbing:
     def test_default_rope_parameters_full_rotary(self):
         # THE classic silent-garbage trap: the Glm4Moe pattern defaults
         # partial_rotary_factor to 0.5 — the contract demands an EXPLICIT 1.0.
-        cfg = ApertusMoeConfig()
+        cfg = Apertus2Config()
         assert cfg.rope_parameters["rope_theta"] == ROPE_THETA
         assert cfg.rope_parameters.get("partial_rotary_factor", None) == 1.0
 
     def test_untied_by_default(self):
-        assert ApertusMoeConfig().tie_word_embeddings is False
+        assert Apertus2Config().tie_word_embeddings is False
 
     def test_pretrained_model_flags(self):
-        assert "e_score_correction_bias" in ApertusMoeForCausalLM._keep_in_fp32_modules_strict
-        assert "ApertusMoeDecoderLayer" in ApertusMoeForCausalLM._no_split_modules
-        assert not ApertusMoeForCausalLM._tied_weights_keys  # untied: EMPTY
+        assert "e_score_correction_bias" in Apertus2ForCausalLM._keep_in_fp32_modules_strict
+        assert "Apertus2DecoderLayer" in Apertus2ForCausalLM._no_split_modules
+        assert not Apertus2ForCausalLM._tied_weights_keys  # untied: EMPTY
 
     def test_rms_norm_eps_wired_from_config(self, make_model):
         """Every RMSNorm in the model (q/k norms, pre-norms, sandwich post-norms,
@@ -243,13 +243,13 @@ class TestContractPlumbing:
             assert layer.post_feedforward_layernorm.variance_epsilon == eps
 
     def test_conversion_mapping_registered_at_import_time(self):
-        # Guide sec 9 item 8: register_checkpoint_conversion_mapping("apertus_moe", ...)
+        # Guide sec 9 item 8: register_checkpoint_conversion_mapping("apertus2", ...)
         # at module top level is load-bearing — without it per-expert disk keys
         # never reach the fused runtime params.
-        mapping = get_checkpoint_conversion_mapping("apertus_moe")
+        mapping = get_checkpoint_conversion_mapping("apertus2")
         assert mapping, (
             "no checkpoint conversion mapping registered for model_type "
-            "'apertus_moe' — modeling_apertus_moe.py must call "
+            "'apertus2' — modeling_apertus2.py must call "
             "register_checkpoint_conversion_mapping at import time"
         )
 
@@ -270,7 +270,7 @@ class TestTensorParallelUnsupported:
         model = make_model()
         assert model.tp_plan == {}
         assert model.model.tp_plan == {}
-        assert ApertusMoeConfig.base_model_tp_plan is None
+        assert Apertus2Config.base_model_tp_plan is None
 
     def test_causal_lm_forward_rejects_tp_ranks(self, make_model, input_ids):
         model = make_model()
@@ -293,11 +293,11 @@ class TestTensorParallelUnsupported:
 class TestConfigValidation:
     def test_explicit_partial_rotary_factor_kwarg_rejected(self):
         with pytest.raises(ValueError, match="partial_rotary_factor"):
-            ApertusMoeConfig(partial_rotary_factor=0.5)
+            Apertus2Config(partial_rotary_factor=0.5)
 
     def test_partial_rotary_factor_in_rope_dict_rejected(self):
         with pytest.raises(ValueError, match="partial_rotary_factor"):
-            ApertusMoeConfig(
+            Apertus2Config(
                 rope_parameters={
                     "rope_type": "default",
                     "rope_theta": ROPE_THETA,
@@ -306,9 +306,9 @@ class TestConfigValidation:
             )
 
     def test_explicit_partial_rotary_factor_one_accepted(self):
-        cfg = ApertusMoeConfig(partial_rotary_factor=1.0)
+        cfg = Apertus2Config(partial_rotary_factor=1.0)
         assert cfg.rope_parameters["partial_rotary_factor"] == 1.0
-        cfg = ApertusMoeConfig(
+        cfg = Apertus2Config(
             rope_parameters={
                 "rope_type": "default",
                 "rope_theta": ROPE_THETA,
@@ -321,28 +321,28 @@ class TestConfigValidation:
         # _tied_weights_keys is EMPTY on the model, so tie_word_embeddings=True
         # would silently do nothing — the config must refuse it.
         with pytest.raises(ValueError, match="tie_word_embeddings"):
-            ApertusMoeConfig(tie_word_embeddings=True)
+            Apertus2Config(tie_word_embeddings=True)
 
     def test_topk1_with_norm_topk_prob_rejected(self):
         # The Megatron fork skips top-k renorm when topk==1; norm_topk_prob=True
         # here would renormalize the single score to 1.0 and silently diverge.
         with pytest.raises(ValueError, match="norm_topk_prob"):
-            ApertusMoeConfig(num_experts_per_tok=1, norm_topk_prob=True)
-        cfg = ApertusMoeConfig(num_experts_per_tok=1, norm_topk_prob=False)
+            Apertus2Config(num_experts_per_tok=1, norm_topk_prob=True)
+        cfg = Apertus2Config(num_experts_per_tok=1, norm_topk_prob=False)
         assert cfg.num_experts_per_tok == 1
 
     def test_legacy_dense_cutoff_is_validated(self):
         with pytest.raises(ValueError, match="first_k_dense_replace"):
-            ApertusMoeConfig(num_hidden_layers=3, first_k_dense_replace=4)
+            Apertus2Config(num_hidden_layers=3, first_k_dense_replace=4)
 
     def test_moe_layer_freq_requires_one_binary_entry_per_layer(self):
         with pytest.raises(ValueError, match="moe_layer_freq"):
-            ApertusMoeConfig(num_hidden_layers=3, moe_layer_freq=[0, 1])
+            Apertus2Config(num_hidden_layers=3, moe_layer_freq=[0, 1])
         with pytest.raises(ValueError, match="moe_layer_freq"):
-            ApertusMoeConfig(num_hidden_layers=3, moe_layer_freq=[0, 2, 1])
+            Apertus2Config(num_hidden_layers=3, moe_layer_freq=[0, 2, 1])
 
     def test_explicit_moe_schedule_is_authoritative_and_normalizes_legacy_cutoff(self):
-        cfg = ApertusMoeConfig(
+        cfg = Apertus2Config(
             num_hidden_layers=5,
             first_k_dense_replace=1,
             moe_layer_freq=[0, 0, 1, 0, 1],
@@ -500,7 +500,7 @@ class TestModuleExistence:
         for L, layer in enumerate(model.model.layers):
             for name in _POST_NORM_NAMES:
                 module = getattr(layer, name, None)
-                assert isinstance(module, ApertusMoeRMSNorm), (
+                assert isinstance(module, Apertus2RMSNorm), (
                     f"sandwich_norm=True but layer {L} lacks '{name}'"
                 )
                 key = f"model.layers.{L}.{name}.weight"
@@ -509,16 +509,16 @@ class TestModuleExistence:
 
     def test_layer_type_split_dense_vs_moe(self, make_model):
         model = make_model(False, None)
-        assert isinstance(model.model.layers[0].mlp, ApertusMoeMLP)
+        assert isinstance(model.model.layers[0].mlp, Apertus2MLP)
         for L in range(TINY_FIRST_K_DENSE, TINY_LAYERS):
-            assert isinstance(model.model.layers[L].mlp, ApertusMoeMoE)
+            assert isinstance(model.model.layers[L].mlp, Apertus2MoE)
 
     def test_interleaved_layer_schedule_builds_the_exact_module_types(self, make_model):
         pattern = [0, 1, 0]
         model = make_model(False, None, moe_layer_freq=pattern)
         assert model.config.moe_layer_freq == pattern
         assert [
-            isinstance(layer.mlp, ApertusMoeMoE) for layer in model.model.layers
+            isinstance(layer.mlp, Apertus2MoE) for layer in model.model.layers
         ] == [False, True, False]
 
     @pytest.mark.parametrize("sandwich_norm", [False, True], ids=["plain", "sandwich"])
@@ -744,7 +744,7 @@ class TestRouterCorrectionBias:
 # group_limited_topk, moe_utils.py:632-650). Dormant at the shipped
 # n_group=1/topk_group=1 — one group, the mask is all-ones — so no other test in
 # this suite ever executes the branch. The oracle below is transcribed from the
-# fork and does not import modeling_apertus_moe.
+# fork and does not import modeling_apertus2.
 # ---------------------------------------------------------------------------
 
 
@@ -1030,14 +1030,14 @@ class TestQuantileBalancing:
     def test_qb_beta_stays_fp32_under_bf16(self, make_model, tmp_path):
         model = make_model(True, TINY_LATENT, use_quantile_balancing=True)
         model.save_pretrained(str(tmp_path))
-        reloaded = ApertusMoeForCausalLM.from_pretrained(
+        reloaded = Apertus2ForCausalLM.from_pretrained(
             str(tmp_path), dtype=torch.bfloat16
         )
         for layer in _moe_layers(reloaded):
             assert layer.mlp.gate.qb_beta.dtype == torch.float32
             assert layer.mlp.gate.e_score_correction_bias.dtype == torch.float32
             assert layer.mlp.gate.weight.dtype == torch.bfloat16
-        assert "qb_beta" in ApertusMoeForCausalLM._keep_in_fp32_modules_strict
+        assert "qb_beta" in Apertus2ForCausalLM._keep_in_fp32_modules_strict
 
     # -- 6. save/load round trip ----------------------------------------------
 
@@ -1059,7 +1059,7 @@ class TestQuantileBalancing:
             torch.testing.assert_close(
                 disk[key], model.model.layers[L].mlp.gate.qb_beta, rtol=0.0, atol=0.0
             )
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(tmp_path), dtype=torch.float32, output_loading_info=True
         )
         reloaded.eval()
@@ -1103,12 +1103,12 @@ class TestQuantileBalancing:
 
     def test_qb_with_group_limited_routing_rejected(self):
         with pytest.raises(ValueError, match="quantile"):
-            ApertusMoeConfig(use_quantile_balancing=True, n_group=2)
+            Apertus2Config(use_quantile_balancing=True, n_group=2)
         with pytest.raises(ValueError, match="quantile"):
-            ApertusMoeConfig(use_quantile_balancing=True, n_group=2, topk_group=2)
-        cfg = ApertusMoeConfig(use_quantile_balancing=True)  # n_group=topk_group=1: fine
+            Apertus2Config(use_quantile_balancing=True, n_group=2, topk_group=2)
+        cfg = Apertus2Config(use_quantile_balancing=True)  # n_group=topk_group=1: fine
         assert cfg.use_quantile_balancing is True
-        assert ApertusMoeConfig().use_quantile_balancing is False
+        assert Apertus2Config().use_quantile_balancing is False
 
 
 # ---------------------------------------------------------------------------
@@ -1235,7 +1235,7 @@ class TestSaveLoadRoundTrip:
     ):
         model = make_model(sandwich_norm, moe_latent_size)
         model.save_pretrained(str(tmp_path))
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(tmp_path), dtype=torch.float32, output_loading_info=True
         )
         reloaded.eval()
@@ -1270,15 +1270,15 @@ class TestSaveLoadRoundTrip:
         with open(os.path.join(str(tmp_path), "config.json")) as f:
             saved_config = json.load(f)
         assert saved_config.get("auto_map") == {
-            "AutoConfig": "configuration_apertus_moe.ApertusMoeConfig",
+            "AutoConfig": "configuration_apertus2.Apertus2Config",
             # Two keys, not three: save_pretrained on a ForCausalLM emits only the auto class
-            # THAT model registered. ApertusMoeModel registers AutoModel separately, which shows
+            # THAT model registered. Apertus2Model registers AutoModel separately, which shows
             # up when saving a bare backbone -- and the EXPORTER writes all three explicitly
             # (exporter/writer.py), which is what a shipped directory carries.
-            "AutoModelForCausalLM": "modeling_apertus_moe.ApertusMoeForCausalLM",
+            "AutoModelForCausalLM": "modeling_apertus2.Apertus2ForCausalLM",
         }
-        assert os.path.isfile(os.path.join(str(tmp_path), "configuration_apertus_moe.py"))
-        assert os.path.isfile(os.path.join(str(tmp_path), "modeling_apertus_moe.py"))
+        assert os.path.isfile(os.path.join(str(tmp_path), "configuration_apertus2.py"))
+        assert os.path.isfile(os.path.join(str(tmp_path), "modeling_apertus2.py"))
 
         # and the dir actually loads through the Auto classes (dynamic module
         # path, NOT the repo import already in sys.path), with zero key issues
@@ -1288,8 +1288,8 @@ class TestSaveLoadRoundTrip:
             dtype=torch.float32,
             output_loading_info=True,
         )
-        assert type(reloaded).__name__ == "ApertusMoeForCausalLM"
-        assert type(reloaded.config).__name__ == "ApertusMoeConfig"
+        assert type(reloaded).__name__ == "Apertus2ForCausalLM"
+        assert type(reloaded.config).__name__ == "Apertus2Config"
         assert not info["missing_keys"], info["missing_keys"]
         assert not info["unexpected_keys"], info["unexpected_keys"]
         assert not info["mismatched_keys"], info["mismatched_keys"]
@@ -1308,7 +1308,7 @@ class TestSaveLoadRoundTrip:
         pin. This test still guards the observable dtype behavior end to end."""
         model = make_model(True, TINY_LATENT)
         model.save_pretrained(str(tmp_path))
-        reloaded = ApertusMoeForCausalLM.from_pretrained(
+        reloaded = Apertus2ForCausalLM.from_pretrained(
             str(tmp_path), dtype=torch.bfloat16
         )
         for layer in _moe_layers(reloaded):
@@ -1341,7 +1341,7 @@ class TestUntiedEmbeddings:
 # requirement 12: stock-Glm4Moe equivalence oracle
 # ---------------------------------------------------------------------------
 
-# Explicit ApertusMoe -> Glm4Moe state-dict rename map (D3 naming decision):
+# Explicit Apertus2 -> Glm4Moe state-dict rename map (D3 naming decision):
 # our pre-norms follow dense Apertus; GLM calls the attention pre-norm
 # "input_layernorm" and — collision trap — the FFN PRE-norm
 # "post_attention_layernorm". Everything else matches key-for-key.
@@ -1353,7 +1353,7 @@ APERTUS_TO_GLM4MOE_RENAMES = [
 
 class TestStockGlm4MoeOracle:
     def test_flagoff_model_matches_stock_glm4_moe(self, make_model):
-        """With sandwich off, latent off and both multipliers 1.0, ApertusMoe
+        """With sandwich off, latent off and both multipliers 1.0, Apertus2
         must be exactly stock Glm4Moe — a free correctness proof for every
         non-novel module (attention, qk-norm, router, experts, shared expert,
         dense layer 0, rope)."""
@@ -1451,7 +1451,7 @@ class TestGenerate:
 # ---------------------------------------------------------------------------
 # KEEL: highway Post-LN residual mode (Megatron fork `--keel`)
 #
-# Contract (as implemented in ApertusMoeDecoderLayer.__init__ / .forward):
+# Contract (as implemented in Apertus2DecoderLayer.__init__ / .forward):
 #   keel_first_layer = (layer_idx == 0)
 #   keel_alpha_val   = config.keel_alpha if not None else float(2 * num_hidden_layers)
 #   keel_residual_scale = 1.0 if first layer else keel_alpha_val
@@ -1557,7 +1557,7 @@ class TestKeel:
         assert cfg2.keel_alpha == 5.0
 
     def test_keel_off_by_default(self):
-        cfg = ApertusMoeConfig()
+        cfg = Apertus2Config()
         assert cfg.keel is False
         assert cfg.keel_alpha is None
 
@@ -1572,7 +1572,7 @@ class TestKeel:
         for L, layer in enumerate(model.model.layers):
             # post_feedforward_layernorm exists on ALL layers (incl. layer 0)
             ff = getattr(layer, "post_feedforward_layernorm", None)
-            assert isinstance(ff, ApertusMoeRMSNorm), f"layer {L} lacks post_feedforward_layernorm"
+            assert isinstance(ff, Apertus2RMSNorm), f"layer {L} lacks post_feedforward_layernorm"
             ff_key = f"model.layers.{L}.post_feedforward_layernorm.weight"
             assert ff_key in state_dict
             assert state_dict[ff_key].shape == (TINY_HIDDEN,)
@@ -1584,7 +1584,7 @@ class TestKeel:
                 assert pa is None, "layer 0 must NOT carry an attention post-norm under KEEL"
                 assert pa_key not in state_dict
             else:
-                assert isinstance(pa, ApertusMoeRMSNorm), f"layer {L} lacks post_attention_layernorm"
+                assert isinstance(pa, Apertus2RMSNorm), f"layer {L} lacks post_attention_layernorm"
                 assert pa_key in state_dict
                 assert state_dict[pa_key].shape == (TINY_HIDDEN,)
 
@@ -1741,7 +1741,7 @@ class TestKeel:
         for L in range(1, TINY_LAYERS):
             assert f"model.layers.{L}.post_attention_layernorm.weight" in disk
 
-        reloaded, info = ApertusMoeForCausalLM.from_pretrained(
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
             str(tmp_path), dtype=torch.float32, output_loading_info=True
         )
         reloaded.eval()
@@ -1793,7 +1793,7 @@ class TestSSSGLUActivation:
         # survive every other check in the suite. Distinguish the two branches by value.
         config = make_config(hidden_act="sssglu")
         torch.manual_seed(0)
-        mlp = ApertusMoeMLP(config)
+        mlp = Apertus2MLP(config)
         activation = resolve_activation("sssglu")
         x = torch.randn(4, config.hidden_size)
         with torch.no_grad():
@@ -1823,7 +1823,7 @@ class TestSSSGLUActivation:
         dense = model.model.layers[0].mlp
         moe = model.model.layers[TINY_FIRST_K_DENSE].mlp
         for owner in (dense, moe.shared_experts, moe.experts):
-            assert type(owner.act_fn).__name__ == "ApertusMoeSSSGLU"
+            assert type(owner.act_fn).__name__ == "Apertus2SSSGLU"
         with torch.no_grad():
             assert torch.isfinite(model(input_ids).logits).all()
 
@@ -1907,7 +1907,7 @@ class TestSlidingWindowAttention:
             first_k_dense_replace=1,
         )
         torch.manual_seed(0)
-        model = ApertusMoeForCausalLM(config).eval()
+        model = Apertus2ForCausalLM(config).eval()
         ids = torch.randint(0, TINY_VOCAB, (1, 8))
         far = ids.clone()
         far[0, 0] = (far[0, 0] + 1) % TINY_VOCAB          # outside the last query's window
@@ -1938,7 +1938,7 @@ class TestSlidingWindowAttention:
     def test_window_reaches_the_attention_backend(self, make_model, input_ids, monkeypatch):
         # flash-attention receives the window through this kwarg and through nothing else, so a
         # mask-only implementation would silently run full attention on every sliding layer.
-        import modeling_apertus_moe as modeling
+        import modeling_apertus2 as modeling
 
         seen = []
         original = modeling.eager_attention_forward
@@ -1970,7 +1970,7 @@ class TestNoRopeLayers:
         self, make_model, input_ids, monkeypatch
     ):
         # A logits comparison alone cannot localise an inverted list, so record the call sites.
-        import modeling_apertus_moe as modeling
+        import modeling_apertus2 as modeling
 
         model = make_model(no_rope_layers=[1, 0, 1])
         model.config._attn_implementation = "eager"
@@ -2006,7 +2006,7 @@ class TestNoRopeLayers:
         changes the relative offsets, which only a rotating layer can see.
         """
         torch.manual_seed(0)
-        model = ApertusMoeForCausalLM(config).eval()
+        model = Apertus2ForCausalLM(config).eval()
         ids = torch.randint(0, TINY_VOCAB, (1, 6))
         with torch.no_grad():
             close = model(input_ids=ids, position_ids=torch.arange(6).unsqueeze(0)).logits
@@ -2040,7 +2040,7 @@ class TestNoRopeLayers:
             hidden_act="sssglu",
         )
         model.save_pretrained(str(tmp_path))
-        reloaded = ApertusMoeForCausalLM.from_pretrained(str(tmp_path), dtype=torch.float32)
+        reloaded = Apertus2ForCausalLM.from_pretrained(str(tmp_path), dtype=torch.float32)
         assert reloaded.config.sliding_window == 5
         assert reloaded.config.layer_types == model.config.layer_types
         assert reloaded.config.no_rope_layers == [1, 0, 1]

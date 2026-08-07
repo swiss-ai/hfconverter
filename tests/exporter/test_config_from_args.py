@@ -2,7 +2,7 @@
 
 The good namespace comes from megatron_mock.make_args_namespace (fork spellings), then each
 test perturbs exactly one attribute. Canonical value checks go through an actually
-constructed ApertusMoeConfig, so they hold whether the kwargs spell a field explicitly or
+constructed Apertus2Config, so they hold whether the kwargs spell a field explicitly or
 lean on a config default, and whether rope is passed as rope_theta or rope_parameters.
 
 Covered: geometry derivations; multipliers on/off with the exact tiny-
@@ -22,7 +22,7 @@ pytest.importorskip("megatron.core")
 import exporter.config_from_args as config_from_args_module  # noqa: E402
 
 import megatron_mock  # noqa: E402
-from configuration_apertus_moe import ApertusMoeConfig  # noqa: E402
+from configuration_apertus2 import Apertus2Config  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # entry-point resolution + result normalization (function name is not pinned by the
@@ -84,7 +84,7 @@ def derive(args):
 
 def derive_config(args):
     kwargs, _, _ = derive(args)
-    return ApertusMoeConfig(**kwargs)
+    return Apertus2Config(**kwargs)
 
 
 def good_args(
@@ -533,7 +533,7 @@ class TestActivationDerivation:
         kwargs, _, _ = derive(good_args(**flags))
         assert kwargs["hidden_act"] == expected, (
             "hidden_act must be derived from the fork's activation flag; falling through to the "
-            "ApertusMoeConfig default would export sssglu weights as a silu model, and nothing "
+            "Apertus2Config default would export sssglu weights as a silu model, and nothing "
             "downstream — shapes, keys, counts — would notice"
         )
         assert derive_config(good_args(**flags)).hidden_act == expected

@@ -32,7 +32,7 @@ torch_dist checkpoint ───────────────────�
 | `validate_stage2_export.py` | Check source provenance and verification settings |
 | `tests.sbatch` | Run the repository tests in the cluster image |
 | `container/build_container.sbatch` | Build the squashfs image referenced by the EDF |
-| `edf/apertus-moe-hf.toml` | Pyxis environment used by conversion and tests |
+| `edf/apertus2-hf.toml` | Pyxis environment used by conversion and tests |
 
 ## Chonk 120B
 
@@ -110,8 +110,8 @@ submitter verifies them against the saved checkpoint before creating a Slurm
 job.
 
 ```bash
-STAGE1_ENV=/iopsstor/scratch/cscs/mvasilev/hfconverter/cluster/edf/apertus-moe-hf.toml \
-HF_ENV=/iopsstor/scratch/cscs/mvasilev/hfconverter/cluster/edf/apertus-moe-hf.toml \
+STAGE1_ENV=/iopsstor/scratch/cscs/mvasilev/hfconverter/cluster/edf/apertus2-hf.toml \
+HF_ENV=/iopsstor/scratch/cscs/mvasilev/hfconverter/cluster/edf/apertus2-hf.toml \
 TRUST_LEGACY_CHECKPOINT=1 \
 SRC_TP=1 \
 SRC_PP=1 \
@@ -160,7 +160,7 @@ Stage 2 is submitted with an `afterok` dependency and defaults to
 The EDF expects the squashfs image at:
 
 ```text
-/iopsstor/scratch/cscs/$USER/images/apertus-moe-hf.sqsh
+/iopsstor/scratch/cscs/$USER/images/apertus2-hf.sqsh
 ```
 
 The build runs through Slurm because Podman and Enroot must operate in the same
@@ -192,7 +192,7 @@ of memory, and a 1 hour 20 minute time limit. It:
 1. builds `cluster/container/Containerfile` with Podman;
 2. imports the image into a temporary squashfs with Enroot;
 3. atomically moves it to
-   `/iopsstor/scratch/cscs/$USER/images/apertus-moe-hf.sqsh`;
+   `/iopsstor/scratch/cscs/$USER/images/apertus2-hf.sqsh`;
 4. launches the resulting image and checks CUDA, PyTorch, Transformers,
    Megatron Core, safetensors, and pytest;
 5. checks that Stage 1 can import the live Megatron fork and its optimizer
@@ -204,9 +204,9 @@ need that checkout. Override paths and the local Podman tag when necessary:
 
 ```bash
 REPO=/iopsstor/scratch/cscs/$USER/hfconverter \
-SQSH_OUT=/iopsstor/scratch/cscs/$USER/images/apertus-moe-hf.sqsh \
+SQSH_OUT=/iopsstor/scratch/cscs/$USER/images/apertus2-hf.sqsh \
 MEGATRON_PATH=/iopsstor/scratch/cscs/$USER/Megatron-LM-MoE \
-IMAGE_TAG=apertus-moe-hf:latest \
+IMAGE_TAG=apertus2-hf:latest \
   sbatch --export=ALL cluster/container/build_container.sbatch
 ```
 

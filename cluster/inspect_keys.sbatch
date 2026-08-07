@@ -14,7 +14,7 @@
 #   # knobs: ALL_KEYS=1 (full key/shape/dtype dump), REPO=..., HF_ENV=...
 # =============================================================================
 
-#SBATCH --job-name=apertus-moe-inspect
+#SBATCH --job-name=apertus2-inspect
 #SBATCH --time=00:15:00
 #SBATCH --partition=debug
 #SBATCH --nodes=1
@@ -30,7 +30,7 @@ set -euo pipefail
 echo "START TIME: $(date)"
 
 REPO=${REPO:-/iopsstor/scratch/cscs/$USER/hfconverter}
-HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 ALL_KEYS=${ALL_KEYS:-}
 
 die() { echo "FATAL: $*" >&2; exit 1; }

@@ -104,7 +104,7 @@ class HFTensorSpec:
 class Plan:
     rows: list[Row]
     synthesized: list[SynthesizedTensor]
-    geometry: dict[str, Any]  # the ApertusMoeConfig kwargs the table was built from
+    geometry: dict[str, Any]  # the Apertus2Config kwargs the table was built from
 
 
 @dataclass(frozen=True)

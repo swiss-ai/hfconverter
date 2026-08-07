@@ -16,7 +16,7 @@
 #   # knobs: REPO=... HF_ENV=... PYTEST_ARGS='tests/exporter -q'
 # =============================================================================
 
-#SBATCH --job-name=apertus-moe-tests
+#SBATCH --job-name=apertus2-tests
 #SBATCH --time=01:00:00
 #SBATCH --partition=debug
 #SBATCH --nodes=1
@@ -32,7 +32,7 @@ set -euo pipefail
 echo "START TIME: $(date)"
 
 REPO=${REPO:-/iopsstor/scratch/cscs/$USER/hfconverter}
-HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 PYTEST_ARGS=${PYTEST_ARGS:-tests/ -q -rs}
 
 die() { echo "FATAL: $*" >&2; exit 1; }

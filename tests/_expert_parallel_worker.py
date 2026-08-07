@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Two-rank CPU worker used by ``test_expert_parallel.py``.
 
-The parent test saves a self-describing ApertusMoe checkpoint and reference outputs.
+The parent test saves a self-describing Apertus2 checkpoint and reference outputs.
 Every rank loads that checkpoint through ``AutoModelForCausalLM`` with expert
 parallelism enabled, then checks both sharding and numerical equivalence: the stacked
 expert banks are split on the expert axis while attention, the router, the shared

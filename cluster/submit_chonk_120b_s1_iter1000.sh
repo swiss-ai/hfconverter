@@ -21,7 +21,7 @@ REPO=${REPO:-$(cd -- "$SCRIPT_DIR/.." && pwd)}
 TD_ITER_DIR=${TD_ITER_DIR:-/iopsstor/scratch/cscs/ahuang/megatron-apertus-moe/_research/results/ckpts/chonk/120b-moe-256e-latent-swa15-nope-s1-muonmd-lr5.889e-3-mlr5.889e-2-latmoe-e256-top8-swa15-w512-nope-s1/iter_0001000}
 TOKENIZER_DIR=${TOKENIZER_DIR:-/iopsstor/scratch/cscs/mvasilev/Megatron-LM-MoE/_research/data/apertus-mul-200k-tokenizer}
 HF_OUT_DIR=${HF_OUT_DIR:-/iopsstor/scratch/cscs/mvasilev/hf-export/chonk-120b-s1-iter1000}
-HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus-moe-hf.toml}
+HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 LOG_DIR=${LOG_DIR:-$REPO/cluster/logs/chonk-120b-s1-iter1000}
 
 PARTITION=${PARTITION:-normal}
@@ -82,7 +82,7 @@ fi
 mkdir -p -- "$LOG_DIR"
 
 if [ -n "$(git -C "$REPO" status --porcelain -- \
-    exporter configuration_apertus_moe.py modeling_apertus_moe.py 2>/dev/null)" ]; then
+    exporter configuration_apertus2.py modeling_apertus2.py 2>/dev/null)" ]; then
     echo "WARNING: exporter/model sources are dirty; conversion_info.json will record a -dirty revision." >&2
 fi
 

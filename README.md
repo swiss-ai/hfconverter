@@ -11,8 +11,8 @@ The repository does not contain model weights.
 
 ```text
 .
-├── configuration_apertus_moe.py   # Hugging Face configuration
-├── modeling_apertus_moe.py        # Hugging Face model and expert parallel plan
+├── configuration_apertus2.py       # Hugging Face configuration
+├── modeling_apertus2.py            # Hugging Face model and expert parallel plan
 ├── exporter/                      # torch_dist reader, mapping, writer, verification
 ├── cluster/                       # Slurm submission and validation scripts
 └── tests/                         # conversion and exported-model tests
@@ -25,10 +25,10 @@ requirements are in [`cluster/README.md`](cluster/README.md).
 The Clariden conversion container is located at:
 
 ```text
-/iopsstor/scratch/cscs/mvasilev/images/apertus-moe-hf.sqsh
+/iopsstor/scratch/cscs/mvasilev/images/apertus2-hf.sqsh
 ```
 
-It is referenced by `cluster/edf/apertus-moe-hf.toml` and can be rebuilt with
+It is referenced by `cluster/edf/apertus2-hf.toml` and can be rebuilt with
 `sbatch cluster/container/build_container.sbatch`.
 
 ## Chonk 120B export
@@ -142,7 +142,7 @@ split / transpose / rename tensors into Hugging Face layout
         │
         ├─ write and bitwise-verify one safetensors shard at a time
         v
-copy tokenizer + custom Apertus MoE configuration/model code
+copy tokenizer + custom Apertus 2 configuration/model code
         │
         ├─ optional full from_pretrained() verification
         v
@@ -173,7 +173,7 @@ The pipeline is:
    and shard instead of the complete model.
 6. The exporter writes the safetensors index, validates and copies the
    tokenizer, creates `config.json`, and copies
-   `configuration_apertus_moe.py` and `modeling_apertus_moe.py`. The
+   `configuration_apertus2.py` and `modeling_apertus2.py`. The
    `auto_map` entries in `config.json` let Transformers load these classes with
    `trust_remote_code=True`.
 7. If `--verify-load` is enabled, the complete exported model is loaded through
@@ -244,8 +244,8 @@ The repository tests only the conversion path and the model implementation
 included in an export:
 
 ```bash
-HF_HOME=/tmp/apertus-moe-hf-hf-home \
-HF_MODULES_CACHE=/tmp/apertus-moe-hf-modules \
+HF_HOME=/tmp/apertus2-hf-hf-home \
+HF_MODULES_CACHE=/tmp/apertus2-hf-modules \
   python -m pytest tests/ -q
 ```
 

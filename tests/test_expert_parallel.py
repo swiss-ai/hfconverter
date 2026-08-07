@@ -20,8 +20,8 @@ import pytest
 import torch
 from transformers.utils import is_torch_greater_or_equal
 
-from configuration_apertus_moe import ApertusMoeConfig
-from modeling_apertus_moe import ApertusMoeForCausalLM
+from configuration_apertus2 import Apertus2Config
+from modeling_apertus2 import Apertus2ForCausalLM
 from conftest import TINY_HIDDEN, TINY_N_EXPERTS, TINY_TOPK
 
 
@@ -36,15 +36,15 @@ TORCHRUN_AVAILABLE = (
 
 
 def test_ep_plan_is_published_and_tp_plan_is_not(make_model):
-    assert ApertusMoeConfig.base_model_tp_plan is None
-    assert ApertusMoeConfig.base_model_ep_plan == {
+    assert Apertus2Config.base_model_tp_plan is None
+    assert Apertus2Config.base_model_ep_plan == {
         "layers.*.mlp.gate": "ep_router",
         "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
         "layers.*.mlp.experts.down_proj": "grouped_gemm",
         "layers.*.mlp.experts": "moe_tp_experts",
     }
     model = make_model()
-    assert model.model._ep_plan == ApertusMoeConfig.base_model_ep_plan
+    assert model.model._ep_plan == Apertus2Config.base_model_ep_plan
 
 
 def test_gate_returns_expert_parallel_triple(make_model):
@@ -112,7 +112,7 @@ def test_two_rank_ep_matches_unsharded_forward_and_generation(make_model, tmp_pa
             layer.mlp.gate.qb_beta.copy_(beta)
     model.save_pretrained(model_dir)
 
-    reference = ApertusMoeForCausalLM.from_pretrained(
+    reference = Apertus2ForCausalLM.from_pretrained(
         model_dir,
         dtype=torch.float32,
     ).eval()

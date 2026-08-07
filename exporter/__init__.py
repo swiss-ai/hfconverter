@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Megatron torch_dist to Hugging Face safetensors exporter for Apertus-2 MoE.
+"""Megatron torch_dist to Hugging Face safetensors exporter for Apertus 2 MoE.
 
 Heavy imports (torch, megatron.core, transformers) live in the submodules; importing the
 bare package stays cheap. Entry points: ``python -m exporter.export`` (CLI) and

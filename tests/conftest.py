@@ -10,8 +10,8 @@ if REPO_ROOT not in sys.path:
 import pytest
 import torch
 
-from configuration_apertus_moe import ApertusMoeConfig
-from modeling_apertus_moe import ApertusMoeForCausalLM
+from configuration_apertus2 import Apertus2Config
+from modeling_apertus2 import Apertus2ForCausalLM
 
 # ---------------------------------------------------------------------------
 # Tiny geometry shared by the model tests:
@@ -35,7 +35,7 @@ TINY_LATENT = 24
 TINY_MAX_POS = 64
 TINY_FIRST_K_DENSE = 1
 
-# ApertusMoeConfig defaults used by the model tests.
+# Apertus2Config defaults used by the model tests.
 EMBEDDING_MULTIPLIER = 27.712812921102035
 RESIDUAL_MULTIPLIER = 0.22360679774997896
 ROPE_THETA = 500000.0
@@ -93,26 +93,26 @@ def _seed_torch():
 
 @pytest.fixture
 def make_config():
-    """Factory for tiny ApertusMoeConfig covering the 2x2 feature matrix."""
+    """Factory for tiny Apertus2Config covering the 2x2 feature matrix."""
 
     def _make(sandwich_norm=False, moe_latent_size=None, **overrides):
         kwargs = dict(TINY_KWARGS)
         kwargs["sandwich_norm"] = sandwich_norm
         kwargs["moe_latent_size"] = moe_latent_size
         kwargs.update(overrides)
-        return ApertusMoeConfig(**kwargs)
+        return Apertus2Config(**kwargs)
 
     return _make
 
 
 @pytest.fixture
 def make_model(make_config):
-    """Factory for a tiny, seeded, eval-mode ApertusMoeForCausalLM."""
+    """Factory for a tiny, seeded, eval-mode Apertus2ForCausalLM."""
 
     def _make(sandwich_norm=False, moe_latent_size=None, seed=0, **overrides):
         torch.manual_seed(seed)
         config = make_config(sandwich_norm, moe_latent_size, **overrides)
-        model = ApertusMoeForCausalLM(config)
+        model = Apertus2ForCausalLM(config)
         model.eval()
         return model
 

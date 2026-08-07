@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Translate saved Megatron training arguments into ``ApertusMoeConfig`` values.
+"""Translate saved Megatron training arguments into ``Apertus2Config`` values.
 
 The checkpoint is the only source of model configuration. Before deriving Hugging Face fields, the
 module checks named support boundaries: options whose tensor layout or forward-pass math cannot be
