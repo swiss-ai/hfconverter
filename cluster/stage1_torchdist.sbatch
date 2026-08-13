@@ -24,6 +24,8 @@ set -euo pipefail
 #   SRC_TP=1 SRC_PP=1 SRC_EP=4 SRC_ETP=1 SRC_CP=1 PRECISION=bf16 \
 #   ROUTING_TYPE=seq_aux_loss MOE_AUX_LOSS_COEFF=1e-4 \
 #   INIT_METHOD_STD=0.0360844 NORM_EPSILON=1e-5 SANDWICH_NORM=0 \
+#   WINDOW_SIZE='(1024,0)' WINDOW_ATTN_SKIP_FREQ='([1,1,1,1,1,0]*2+[1,1,1,1,0])' \
+#   NO_ROPE_FREQ='([0,0,0,0,0,1]*2+[0,0,0,0,1])' \
 #     sbatch --export=ALL \
 #     cluster/stage1_torchdist.sbatch SRC_CKPT DST_ROOT
 #
@@ -49,6 +51,17 @@ MOE_AUX_LOSS_COEFF=${MOE_AUX_LOSS_COEFF:-1e-4}
 INIT_METHOD_STD=${INIT_METHOD_STD:-0.0360844}
 NORM_EPSILON=${NORM_EPSILON:-1e-5}
 SANDWICH_NORM=${SANDWICH_NORM:-0}
+# Sliding-window and NoPE patterns, in the fork's own CLI spelling. These are NOT optional
+# polish: megatron/training/checkpointing.py:set_args_from_checkpoint restores ~90 arguments and
+# window_size / window_attn_skip_freq / no_rope_freq are in none of them, so --use-checkpoint-args
+# leaves all three at None. Neither has a parameter footprint, so the strict tensor load below
+# still succeeds and the resulting torch_dist checkpoint records "full attention on every layer,
+# RoPE on every layer". Stage 2 derives config.json from exactly those saved arguments, so an
+# omission here is not a crash — it is a model that loads, generates fluent text, and computes
+# the wrong attention on every layer. Empty means "the source really had none".
+WINDOW_SIZE=${WINDOW_SIZE:-}
+WINDOW_ATTN_SKIP_FREQ=${WINDOW_ATTN_SKIP_FREQ:-}
+NO_ROPE_FREQ=${NO_ROPE_FREQ:-}
 MEGATRON_PATH=${MEGATRON_PATH:-/iopsstor/scratch/cscs/${USER}/Megatron-LM-MoE}
 # Pyxis consumes an EDF file, not the cluster/container source directory.  The
 # repository EDF points at the already-built images/apertus2-hf.sqsh image.
@@ -70,10 +83,12 @@ if ((SRC_TP % SRC_ETP != 0)); then
   echo "SRC_ETP must divide SRC_TP; got SRC_TP=${SRC_TP}, SRC_ETP=${SRC_ETP}." >&2
   exit 1
 fi
-if ((SRC_CP != 1)); then
-  echo "This Stage 1 implementation supports only SRC_CP=1; got SRC_CP=${SRC_CP}." >&2
-  exit 1
-fi
+# SRC_CP describes the SOURCE run, not this job. Context parallelism splits the sequence, never
+# the parameters: a CP=4 run writes exactly the same mp_rank_<tp>_<ep> directories as a CP=1 run
+# (get_checkpoint_name takes no CP rank), and check_checkpoint_args never compares it. So Stage 1
+# reads a CP>1 checkpoint at CP=1 — which it must, since WORLD_SIZE below is TP*PP*EP and this job
+# has four GPUs. The value is still validated and echoed because validate_source_profile.py
+# compares it against the saved args, where a mismatch means the operator described a different run.
 if ((WORLD_SIZE > 4)); then
   echo "Source topology requires ${WORLD_SIZE} ranks, but this job has 4 GPUs." >&2
   exit 1
@@ -132,6 +147,26 @@ case ${SANDWICH_NORM} in
   *) echo "SANDWICH_NORM must be 1/0, true/false, or yes/no; got: ${SANDWICH_NORM}" >&2; exit 1 ;;
 esac
 
+# The three pattern arguments are forwarded verbatim to Megatron, which evaluates them with
+# arguments.py:_eval_pattern -- a bare eval() behind exactly this character whitelist. Reject
+# anything else here so a typo fails at submission instead of inside the container.
+# Held in a variable because =~ treats a quoted pattern as a literal string; and written with a
+# leading ']' because a bracket expression has no escape character -- '\]' would close the set.
+PATTERN_CHARSET='^[][0-9,()+*]+$'
+for pattern_name in WINDOW_SIZE WINDOW_ATTN_SKIP_FREQ NO_ROPE_FREQ; do
+  pattern_value=${!pattern_name}
+  if [[ -n ${pattern_value} && ! ${pattern_value} =~ $PATTERN_CHARSET ]]; then
+    echo "${pattern_name} may contain only digits and , [ ] ( ) + * ; got: ${pattern_value}" >&2
+    exit 1
+  fi
+done
+# is_layer_window_attention treats a missing skip frequency as "every layer slides", so a
+# per-layer pattern without a window is not a milder request -- it is a different model.
+if [[ -n ${WINDOW_ATTN_SKIP_FREQ} && -z ${WINDOW_SIZE} ]]; then
+  echo "WINDOW_ATTN_SKIP_FREQ needs WINDOW_SIZE; without it no layer slides at all." >&2
+  exit 1
+fi
+
 TRACKER=${SRC_CKPT}/latest_checkpointed_iteration.txt
 if [[ ! -f ${TRACKER} ]]; then
   echo "Source checkpoint has no iteration tracker: ${TRACKER}" >&2
@@ -157,17 +192,22 @@ fi
 mkdir -p "${DST_ROOT}"
 export SRC_CKPT DST_ROOT SRC_TP SRC_PP SRC_EP SRC_ETP SRC_CP PRECISION TRUST_LEGACY_CHECKPOINT
 export ROUTING_TYPE MOE_AUX_LOSS_COEFF INIT_METHOD_STD NORM_EPSILON SANDWICH_NORM
+export WINDOW_SIZE WINDOW_ATTN_SKIP_FREQ NO_ROPE_FREQ
 export MEGATRON_PATH WORLD_SIZE GLOBAL_BATCH_SIZE SOURCE_ITER_DIR
 MEGATRON_LOG=${DST_ROOT}/stage1-megatron.log
 echo "Stage 1 environment: ${STAGE1_ENV}"
 echo "Stage 1 image      : ${STAGE1_IMAGE}"
+echo "Source context parallel size: ${SRC_CP} (Stage 1 always runs at 1; CP shards no parameters)"
+echo "Sliding window     : ${WINDOW_SIZE:-<none — every layer uses full attention>}"
+echo "Window skip pattern: ${WINDOW_ATTN_SKIP_FREQ:-<none — every layer slides if a window is set>}"
+echo "NoPE pattern       : ${NO_ROPE_FREQ:-<none — every layer applies RoPE>}"
 
 # Start one container task. torchrun below creates the individual Megatron ranks.
 srun \
   --mpi=pmix \
   --network=disable_rdzv_get \
   --environment="${STAGE1_ENV}" \
-  --export=ALL,SRC_CKPT,DST_ROOT,SRC_TP,SRC_PP,SRC_EP,SRC_ETP,SRC_CP,PRECISION,TRUST_LEGACY_CHECKPOINT,ROUTING_TYPE,MOE_AUX_LOSS_COEFF,INIT_METHOD_STD,NORM_EPSILON,SANDWICH_NORM,MEGATRON_PATH,WORLD_SIZE,GLOBAL_BATCH_SIZE,SOURCE_ITER_DIR \
+  --export=ALL,SRC_CKPT,DST_ROOT,SRC_TP,SRC_PP,SRC_EP,SRC_ETP,SRC_CP,PRECISION,TRUST_LEGACY_CHECKPOINT,ROUTING_TYPE,MOE_AUX_LOSS_COEFF,INIT_METHOD_STD,NORM_EPSILON,SANDWICH_NORM,WINDOW_SIZE,WINDOW_ATTN_SKIP_FREQ,NO_ROPE_FREQ,MEGATRON_PATH,WORLD_SIZE,GLOBAL_BATCH_SIZE,SOURCE_ITER_DIR \
   -u bash -lc '
 set -euo pipefail
 if [[ ${TRUST_LEGACY_CHECKPOINT} != 1 ]]; then
@@ -215,6 +255,19 @@ case ${SANDWICH_NORM} in
   *) sandwich_args=() ;;
 esac
 
+# An unset pattern must contribute NO flag: --window-size "" would parse as an empty tuple
+# rather than "no sliding window".
+attention_pattern_args=()
+if [[ -n ${WINDOW_SIZE} ]]; then
+  attention_pattern_args+=(--window-size "${WINDOW_SIZE}")
+fi
+if [[ -n ${WINDOW_ATTN_SKIP_FREQ} ]]; then
+  attention_pattern_args+=(--window-attn-skip-freq "${WINDOW_ATTN_SKIP_FREQ}")
+fi
+if [[ -n ${NO_ROPE_FREQ} ]]; then
+  attention_pattern_args+=(--no-rope-freq "${NO_ROPE_FREQ}")
+fi
+
 # Build the model, load legacy weights, save torch_dist, and exit without training.
 # Router fp32 is a supported-source invariant required by the Stage 2/HF contract.
 # The source-profile preflight protects arguments the fork cannot restore safely.
@@ -235,12 +288,13 @@ python -m torch.distributed.run \
   --pipeline-model-parallel-size "${SRC_PP}" \
   --expert-model-parallel-size "${SRC_EP}" \
   --expert-tensor-parallel-size "${SRC_ETP}" \
-  --context-parallel-size "${SRC_CP}" \
+  --context-parallel-size 1 \
   --transformer-impl transformer_engine \
   "${precision_flag}" \
   --init-method-std "${INIT_METHOD_STD}" \
   --norm-epsilon "${NORM_EPSILON}" \
   "${sandwich_args[@]}" \
+  "${attention_pattern_args[@]}" \
   --moe-router-dtype fp32 \
   --moe-router-load-balancing-type "${routing_type_args[@]}" \
   --moe-aux-loss-coeff "${aux_loss_coeff_args[@]}" \

@@ -11,6 +11,7 @@ from __future__ import print_function
 
 import argparse
 import math
+import re
 import sys
 
 from ckpt_args import read_checkpoint_args
@@ -20,6 +21,45 @@ def _as_list(value):
     if isinstance(value, (list, tuple)):
         return list(value)
     return [value]
+
+
+# Mirrors megatron/training/arguments.py:_eval_pattern. Stage 1 hands these strings straight to
+# Megatron, which evaluates them with a bare eval() behind exactly this whitelist, so computing the
+# same value here is what makes the comparison below meaningful. The length cap is this module's
+# own addition: the whitelist still admits "[1]*99999999".
+_PATTERN_REJECT = re.compile(r"[^,\d\[\]\(\)\+\*]")
+_PATTERN_MAX_LENGTH = 4096
+
+
+def _eval_pattern(text):
+    if len(text) > _PATTERN_MAX_LENGTH:
+        raise ValueError("pattern is longer than {} characters".format(_PATTERN_MAX_LENGTH))
+    if _PATTERN_REJECT.search(text):
+        raise ValueError("pattern may contain only digits and , [ ] ( ) + * : {!r}".format(text))
+    return eval(text, {"__builtins__": {}}, {})  # noqa: S307 - whitelisted above, as in the fork
+
+
+def _parse_freq_pattern(text):
+    """Parse --window-attn-skip-freq / --no-rope-freq the way moe_freq_type does. '' -> None."""
+    if not text:
+        return None
+    if "[" in text:
+        return _eval_pattern(text)
+    return int(text)
+
+
+def _parse_window_size(text):
+    """Parse --window-size the way tuple_type does. '' -> None."""
+    if not text:
+        return None
+    return tuple(int(item) for item in text.strip("()").split(","))
+
+
+def _same_sequence(actual, expected):
+    """Compare pattern values without letting a list/tuple round-trip count as a difference."""
+    if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        return list(actual) == list(expected)
+    return actual == expected
 
 
 def _float_list(text):
@@ -127,6 +167,35 @@ def validate(saved, requested):
                 )
             )
 
+    # The sliding-window and NoPE patterns are the one class of forward-changing option that
+    # Stage 1 must re-supply by hand: set_args_from_checkpoint does not restore them, and neither
+    # adds a parameter, so nothing downstream would notice their absence. Comparing the operator's
+    # strings against the saved values here is what turns a forgotten flag into a refused
+    # submission instead of an exported model that attends over the wrong span on every layer.
+    pattern_fields = (
+        ("window_size", "window_size", _parse_window_size),
+        ("window_attn_skip_freq", "window_attn_skip_freq", _parse_freq_pattern),
+        ("no_rope_freq", "no_rope_freq", _parse_freq_pattern),
+    )
+    for checkpoint_name, request_name, parse in pattern_fields:
+        try:
+            expected = parse(getattr(requested, request_name))
+        except (SyntaxError, TypeError, ValueError) as exc:
+            problems.append(
+                "cannot parse {}={!r}: {}".format(
+                    request_name.upper(), getattr(requested, request_name), exc
+                )
+            )
+            continue
+        actual = saved.get(checkpoint_name)
+        if not _same_sequence(actual, expected):
+            problems.append(
+                "{}={!r}, but the command supplied {!r}; Stage 1 does not restore this "
+                "argument from the checkpoint, so it has to be passed explicitly".format(
+                    checkpoint_name, actual, expected
+                )
+            )
+
     # These are fixed by the current Stage-1/HF implementation, not user overrides.
     if saved.get("moe_router_dtype") != "fp32":
         problems.append(
@@ -212,6 +281,12 @@ def main(argv=None):
     parser.add_argument("--init-method-std", required=True)
     parser.add_argument("--norm-epsilon", required=True)
     parser.add_argument("--sandwich-norm", required=True)
+    # Required, but an empty string is a valid answer: it asserts the source had no sliding
+    # window / no NoPE schedule. Making them optional would let the dangerous default -- silence --
+    # keep meaning "unset" for a checkpoint that has them.
+    parser.add_argument("--window-size", required=True)
+    parser.add_argument("--window-attn-skip-freq", required=True)
+    parser.add_argument("--no-rope-freq", required=True)
     args = parser.parse_args(argv)
 
     try:

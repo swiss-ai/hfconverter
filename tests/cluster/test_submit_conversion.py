@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from gate_helpers import write_checkpoint
 
 
@@ -36,6 +38,9 @@ def make_layout(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
             "sandwich_norm": True,
             "moe_router_dtype": "fp32",
             "transformer_impl": "transformer_engine",
+            "window_size": (1024, 0),
+            "window_attn_skip_freq": [1, 1, 1, 0],
+            "no_rope_freq": [0, 0, 0, 1],
         },
         iteration=730,
     )
@@ -63,11 +68,15 @@ def make_layout(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
     sbatch.write_text(
         "#!/bin/bash\n"
         f"printf '%s | SRC_EP=%s SANDWICH_NORM=%s MOE_AUX_LOSS_COEFF=%s "
-        f"STAGE1_ENV=%s TRUST_LEGACY_CHECKPOINT=%s HF_ENV=%s TD_ITER_DIR=%s HF_OUT_DIR=%s VERIFY_LOAD=%s SKIP_INSPECT=<%s> FORCE_NO=<%s> FORCE_YES=<%s>\\n' "
+        f"STAGE1_ENV=%s TRUST_LEGACY_CHECKPOINT=%s HF_ENV=%s TD_ITER_DIR=%s HF_OUT_DIR=%s VERIFY_LOAD=%s "
+        f"SKIP_INSPECT=<%s> FORCE_NO=<%s> FORCE_YES=<%s> "
+        f"WINDOW_SIZE=<%s> WINDOW_ATTN_SKIP_FREQ=<%s> NO_ROPE_FREQ=<%s>\\n' "
         f"\"$*\" \"${{SRC_EP-}}\" \"${{SANDWICH_NORM-}}\" "
         f"\"${{MOE_AUX_LOSS_COEFF-}}\" \"${{STAGE1_ENV-}}\" \"${{TRUST_LEGACY_CHECKPOINT-}}\" \"${{HF_ENV-}}\" \"${{TD_ITER_DIR-}}\" "
         f"\"${{HF_OUT_DIR-}}\" \"${{VERIFY_LOAD-}}\" \"${{SKIP_INSPECT-}}\" "
-        f"\"${{TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD-__UNSET__}}\" \"${{TORCH_FORCE_WEIGHTS_ONLY_LOAD-__UNSET__}}\" >> {calls}\n"
+        f"\"${{TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD-__UNSET__}}\" \"${{TORCH_FORCE_WEIGHTS_ONLY_LOAD-__UNSET__}}\" "
+        f"\"${{WINDOW_SIZE-__UNSET__}}\" \"${{WINDOW_ATTN_SKIP_FREQ-__UNSET__}}\" "
+        f"\"${{NO_ROPE_FREQ-__UNSET__}}\" >> {calls}\n"
         f"n=0; [ ! -f {count} ] || n=$(<{count}); n=$((n + 1)); "
         f"printf '%s' \"$n\" > {count}\n"
         "printf '4100%s\\n' \"$n\"\n"
@@ -95,6 +104,9 @@ def make_layout(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
         INIT_METHOD_STD="0.0360844",
         NORM_EPSILON="1e-5",
         SANDWICH_NORM="1",
+        WINDOW_SIZE="(1024,0)",
+        WINDOW_ATTN_SKIP_FREQ="([1,1,1,0])",
+        NO_ROPE_FREQ="([0,0,0,1])",
         TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="1",
         TORCH_FORCE_WEIGHTS_ONLY_LOAD="1",
     )
@@ -159,6 +171,105 @@ def test_missing_profile_value_fails_before_any_submission(tmp_path: Path):
     assert result.returncode != 0
     assert "SANDWICH_NORM is required" in result.stderr
     assert not calls.exists()
+
+
+def test_sliding_window_and_nope_patterns_reach_stage1(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    stage1 = calls.read_text().splitlines()[0]
+    assert "WINDOW_SIZE=<(1024,0)>" in stage1
+    assert "WINDOW_ATTN_SKIP_FREQ=<([1,1,1,0])>" in stage1
+    assert "NO_ROPE_FREQ=<([0,0,0,1])>" in stage1
+
+
+@pytest.mark.parametrize(
+    "name", ["WINDOW_SIZE", "WINDOW_ATTN_SKIP_FREQ", "NO_ROPE_FREQ"]
+)
+def test_undeclared_attention_pattern_fails_before_any_submission(
+    tmp_path: Path, name: str
+):
+    # Unset must not be readable as "the source has none": Megatron restores none of these and
+    # they leave no tensor evidence, so the wrong answer exports silently.
+    env, source, output, calls = make_layout(tmp_path)
+    env.pop(name)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert f"{name} must be set" in result.stderr
+    assert not calls.exists()
+
+
+def test_empty_attention_patterns_are_accepted_for_a_source_without_them(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    write_checkpoint(
+        source,
+        {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 4,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+            "bf16": True,
+            "fp16": False,
+            "moe_router_load_balancing_type": "seq_aux_loss",
+            "moe_aux_loss_coeff": 1e-3,
+            "init_method_std": 0.0360844,
+            "layernorm_epsilon": 1e-5,
+            "sandwich_norm": True,
+            "moe_router_dtype": "fp32",
+            "transformer_impl": "transformer_engine",
+        },
+        iteration=731,
+    )
+    (source / "latest_checkpointed_iteration.txt").write_text("731\n")
+    env.update(WINDOW_SIZE="", WINDOW_ATTN_SKIP_FREQ="", NO_ROPE_FREQ="")
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    stage1 = calls.read_text().splitlines()[0]
+    assert "WINDOW_SIZE=<>" in stage1
+    assert "NO_ROPE_FREQ=<>" in stage1
+
+
+def test_source_context_parallelism_above_one_is_converted(tmp_path: Path):
+    # p2 of the 9.3b ctxext row trains at CP=4.  CP shards the sequence, not the parameters,
+    # so the iteration directory holds the same mp_rank_<tp>_<ep> shards as a CP=1 run.
+    env, source, output, calls = make_layout(tmp_path)
+    write_checkpoint(
+        source,
+        {
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 4,
+            "expert_tensor_parallel_size": 1,
+            "context_parallel_size": 4,
+            "bf16": True,
+            "fp16": False,
+            "moe_router_load_balancing_type": "seq_aux_loss",
+            "moe_aux_loss_coeff": 1e-3,
+            "init_method_std": 0.0360844,
+            "layernorm_epsilon": 1e-5,
+            "sandwich_norm": True,
+            "moe_router_dtype": "fp32",
+            "transformer_impl": "transformer_engine",
+            "window_size": (1024, 0),
+            "window_attn_skip_freq": [1, 1, 1, 0],
+            "no_rope_freq": [0, 0, 0, 1],
+        },
+        iteration=732,
+    )
+    (source / "latest_checkpointed_iteration.txt").write_text("732\n")
+    env["SRC_CP"] = "4"
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    assert len(calls.read_text().splitlines()) == 2
 
 
 def test_missing_trusted_checkpoint_assertion_fails_before_submission(tmp_path: Path):
@@ -277,6 +388,65 @@ def test_unsupported_source_topology_fails_before_any_submission(tmp_path: Path)
 
     assert result.returncode != 0
     assert "needs 8 ranks" in result.stderr
+    assert not calls.exists()
+
+
+def test_no_reservation_is_requested_by_default(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    for stale in ("RESERVATION", "STAGE2_PARTITION"):
+        env.pop(stale, None)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    assert "--reservation" not in calls.read_text()
+    assert "--partition" not in calls.read_text()
+
+
+def test_reservation_reaches_both_jobs(tmp_path: Path):
+    env, source, output, calls = make_layout(tmp_path)
+    env.update(RESERVATION="SD-69241-apertus-1-5-0", STAGE2_PARTITION="normal")
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode == 0, result.stderr
+    stage1, stage2 = calls.read_text().splitlines()
+    assert "--reservation=SD-69241-apertus-1-5-0" in stage1
+    assert "--reservation=SD-69241-apertus-1-5-0" in stage2
+    # Only Stage 2 needs the partition override; Stage 1's #SBATCH header is already `normal`.
+    assert "--partition=normal" in stage2
+
+
+def test_reservation_without_a_partition_is_refused(tmp_path: Path):
+    # A reservation is scoped to one partition, and Stage 2 defaults to `debug`.  Accepting the
+    # reservation alone would queue a job the reservation cannot admit.
+    env, source, output, calls = make_layout(tmp_path)
+    env["RESERVATION"] = "SD-69241-apertus-1-5-0"
+    env.pop("STAGE2_PARTITION", None)
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert "also needs STAGE2_PARTITION" in result.stderr
+    assert not calls.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RESERVATION", "res --uid=0"),
+        ("STAGE2_PARTITION", "normal;whoami"),
+    ],
+)
+def test_reservation_names_are_restricted(tmp_path: Path, name: str, value: str):
+    env, source, output, calls = make_layout(tmp_path)
+    env.update(RESERVATION="SD-69241-apertus-1-5-0", STAGE2_PARTITION="normal")
+    env[name] = value
+
+    result = run_submitter(env, source, output)
+
+    assert result.returncode != 0
+    assert name in result.stderr
     assert not calls.exists()
 
 

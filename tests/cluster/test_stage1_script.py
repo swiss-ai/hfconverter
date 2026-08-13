@@ -94,6 +94,69 @@ def test_script_fills_native_router_restore_gaps_with_readable_defaults():
     assert 'read -r -a aux_loss_coeff_args <<< "${MOE_AUX_LOSS_COEFF}"' in text
 
 
+def test_sliding_window_and_nope_patterns_reach_megatron():
+    # set_args_from_checkpoint restores neither, and neither adds a parameter, so dropping this
+    # forwarding exports a full-attention RoPE-everywhere model that still loads strictly.
+    text = SCRIPT.read_text()
+
+    assert "WINDOW_SIZE=${WINDOW_SIZE:-}" in text
+    assert "WINDOW_ATTN_SKIP_FREQ=${WINDOW_ATTN_SKIP_FREQ:-}" in text
+    assert "NO_ROPE_FREQ=${NO_ROPE_FREQ:-}" in text
+    assert 'attention_pattern_args+=(--window-size "${WINDOW_SIZE}")' in text
+    assert 'attention_pattern_args+=(--window-attn-skip-freq "${WINDOW_ATTN_SKIP_FREQ}")' in text
+    assert 'attention_pattern_args+=(--no-rope-freq "${NO_ROPE_FREQ}")' in text
+    assert '"${attention_pattern_args[@]}"' in text
+    # The container task gets its own environment; a forwarded flag that never crosses the
+    # srun boundary is the same silent failure.
+    assert "WINDOW_SIZE,WINDOW_ATTN_SKIP_FREQ,NO_ROPE_FREQ" in text
+
+
+def test_stage1_reads_a_context_parallel_source_at_cp_one():
+    # CP splits the sequence, not the parameters: the source's CP is metadata for the
+    # preflight, and this four-GPU job must run the load itself at CP=1.
+    text = SCRIPT.read_text()
+
+    assert "--context-parallel-size 1" in text
+    assert '--context-parallel-size "${SRC_CP}"' not in text
+    assert "supports only SRC_CP=1" not in text
+
+
+def test_pattern_arguments_are_restricted_to_the_fork_whitelist(tmp_path):
+    result = run_script(
+        str(make_source(tmp_path)),
+        str(tmp_path / "destination"),
+        NO_ROPE_FREQ="__import__('os').system('id')",
+    )
+
+    assert result.returncode != 0
+    assert "NO_ROPE_FREQ may contain only digits" in result.stderr
+
+
+def test_layer_pattern_without_a_window_is_rejected(tmp_path):
+    # is_layer_window_attention reads a missing window_size as "no layer slides", so this
+    # combination silently discards the pattern rather than applying a default window.
+    result = run_script(
+        str(make_source(tmp_path)),
+        str(tmp_path / "destination"),
+        WINDOW_ATTN_SKIP_FREQ="([1,1,1,1,1,0]*2+[1,1,1,1,0])",
+    )
+
+    assert result.returncode != 0
+    assert "WINDOW_ATTN_SKIP_FREQ needs WINDOW_SIZE" in result.stderr
+
+
+def test_source_context_parallelism_above_one_is_accepted(tmp_path):
+    result = run_script(
+        str(tmp_path / "source"),
+        str(tmp_path / "destination"),
+        SRC_CP="4",
+    )
+
+    # It still fails, but on the missing source directory -- not on the CP value.
+    assert "SRC_CP" not in result.stderr
+    assert "Source checkpoint does not exist" in result.stderr
+
+
 def test_missing_positional_paths_prints_usage():
     result = run_script()
 

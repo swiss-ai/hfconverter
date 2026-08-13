@@ -9,7 +9,13 @@
 #   SRC_TP=1 SRC_PP=1 SRC_EP=4 SRC_ETP=1 SRC_CP=1 PRECISION=bf16 \
 #   ROUTING_TYPE=seq_aux_loss MOE_AUX_LOSS_COEFF=1e-4 \
 #   INIT_METHOD_STD=0.0360844 NORM_EPSILON=1e-5 SANDWICH_NORM=0 \
+#   WINDOW_SIZE= WINDOW_ATTN_SKIP_FREQ= NO_ROPE_FREQ= \
 #     cluster/submit_conversion.sh SOURCE_CHECKPOINT OUTPUT_ROOT
+#
+# WINDOW_SIZE, WINDOW_ATTN_SKIP_FREQ and NO_ROPE_FREQ must be set even when empty.  Megatron
+# does not restore them from a checkpoint and they leave no tensor evidence, so an unset value
+# would silently export a full-attention, RoPE-everywhere model.  Empty asserts the source had
+# none; the preflight below checks either answer against the saved arguments.
 #
 # Result:
 #   OUTPUT_ROOT/torch_dist/iter_XXXXXXX/   normalized Megatron checkpoint
@@ -33,6 +39,12 @@ TRUST_LEGACY_CHECKPOINT=${TRUST_LEGACY_CHECKPOINT:-0}
 HF_ENV=${HF_ENV:-$REPO/cluster/edf/apertus2-hf.toml}
 EXTRA_EXPORT_ARGS=${EXTRA_EXPORT_ARGS:-}
 LOG_DIR=${LOG_DIR:-$REPO/cluster/logs}
+# A Slurm reservation is scoped to a partition, so it cannot be set on its own: Stage 2's
+# #SBATCH default is --partition=debug, and a debug job is refused by a reservation held on
+# `normal`.  Setting RESERVATION therefore also requires STAGE2_PARTITION to name that
+# reservation's partition.  Empty means "use each stage's own #SBATCH defaults".
+RESERVATION=${RESERVATION:-}
+STAGE2_PARTITION=${STAGE2_PARTITION:-}
 
 die() {
     echo "ERROR: $*" >&2
@@ -76,6 +88,15 @@ required_profile=(
 )
 for name in "${required_profile[@]}"; do
     [ -n "${!name:-}" ] || die "$name is required; copy it from the source checkpoint profile"
+done
+# These three are required to be SET but are allowed to be EMPTY, so they need the
+# set-vs-nonempty test rather than the loop above.  Empty is the answer for a checkpoint with
+# no sliding window and no NoPE schedule; unset is never a safe default.
+required_patterns=(WINDOW_SIZE WINDOW_ATTN_SKIP_FREQ NO_ROPE_FREQ)
+for name in "${required_patterns[@]}"; do
+    [ -n "${!name+set}" ] \
+        || die "$name must be set (empty is allowed, and asserts the source checkpoint has none); \
+Megatron does not restore it and it leaves no tensor evidence"
 done
 [ "$TRUST_LEGACY_CHECKPOINT" = 1 ] \
     || die "set TRUST_LEGACY_CHECKPOINT=1 only after confirming the legacy checkpoint is trusted"
@@ -140,12 +161,30 @@ if [ -d "$OUTPUT_ROOT" ] && [ -n "$(ls -A "$OUTPUT_ROOT" 2>/dev/null)" ]; then
     die "output root is not empty; preserve it and choose a fresh path: $OUTPUT_ROOT"
 fi
 
+# Both values land on an sbatch command line, so restrict them to Slurm's own name syntax.
+reservation_args=()
+stage2_partition_args=()
+if [ -n "$RESERVATION" ]; then
+    [[ "$RESERVATION" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "RESERVATION must be a Slurm reservation name, got: $RESERVATION"
+    [ -n "$STAGE2_PARTITION" ] \
+        || die "RESERVATION=$RESERVATION also needs STAGE2_PARTITION: a reservation belongs to \
+one partition, and Stage 2 otherwise submits to its #SBATCH default (debug).  Read the partition \
+off 'scontrol show res $RESERVATION'."
+    reservation_args=(--reservation="$RESERVATION")
+fi
+if [ -n "$STAGE2_PARTITION" ]; then
+    [[ "$STAGE2_PARTITION" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "STAGE2_PARTITION must be a Slurm partition name, got: $STAGE2_PARTITION"
+    stage2_partition_args=(--partition="$STAGE2_PARTITION")
+fi
+
 for name in SRC_TP SRC_PP SRC_EP SRC_ETP SRC_CP; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] \
         || die "$name must be a positive integer, got: ${!name}"
 done
-[ "$SRC_CP" -eq 1 ] \
-    || die "this Stage 1 implementation supports only SRC_CP=1, got: $SRC_CP"
+# SRC_CP describes the source run only.  Context parallelism splits the sequence, not the
+# parameters, so a CP>1 run writes the same mp_rank_<tp>_<ep> shards; Stage 1 reads them at CP=1.
 ((SRC_TP % SRC_ETP == 0)) \
     || die "SRC_ETP must divide SRC_TP; got SRC_TP=$SRC_TP and SRC_ETP=$SRC_ETP"
 WORLD_SIZE=$((SRC_TP * SRC_PP * SRC_EP))
@@ -181,6 +220,9 @@ python3 "$SCRIPT_DIR/validate_source_profile.py" "$SOURCE_CHECKPOINT" \
     --routing-type "$ROUTING_TYPE" --moe-aux-loss-coeff "$MOE_AUX_LOSS_COEFF" \
     --init-method-std "$INIT_METHOD_STD" --norm-epsilon "$NORM_EPSILON" \
     --sandwich-norm "$SANDWICH_NORM" \
+    --window-size "$WINDOW_SIZE" \
+    --window-attn-skip-freq "$WINDOW_ATTN_SKIP_FREQ" \
+    --no-rope-freq "$NO_ROPE_FREQ" \
     || die "the supplied parameters do not describe the source checkpoint"
 
 TD_ITER_DIR=$OUTPUT_ROOT/torch_dist/$ITERATION_DIR
@@ -194,6 +236,11 @@ echo "  source topology   : TP=$SRC_TP PP=$SRC_PP EP=$SRC_EP ETP=$SRC_ETP CP=$SR
 echo "  precision         : $PRECISION (router fp32 is enforced by Stage 1)"
 echo "  routing           : $ROUTING_TYPE; aux coefficient: $MOE_AUX_LOSS_COEFF"
 echo "  sandwich norm     : $SANDWICH_NORM"
+echo "  sliding window    : ${WINDOW_SIZE:-<none>}"
+echo "  window skip freq  : ${WINDOW_ATTN_SKIP_FREQ:-<none>}"
+echo "  no-rope freq      : ${NO_ROPE_FREQ:-<none>}"
+echo "  reservation       : ${RESERVATION:-<none — the per-stage #SBATCH defaults apply>}"
+echo "  Stage 2 partition : ${STAGE2_PARTITION:-<stage2_export.sbatch default>}"
 echo "  Stage 1 environment: $STAGE1_ENV"
 echo "  legacy pickle     : trusted by explicit operator assertion"
 echo "  HF environment    : $HF_ENV"
@@ -205,9 +252,12 @@ stage1_job=$(env -u JOB_ID_FILE \
     SRC_CP="$SRC_CP" PRECISION="$PRECISION" ROUTING_TYPE="$ROUTING_TYPE" \
     MOE_AUX_LOSS_COEFF="$MOE_AUX_LOSS_COEFF" INIT_METHOD_STD="$INIT_METHOD_STD" \
     NORM_EPSILON="$NORM_EPSILON" SANDWICH_NORM="$SANDWICH_NORM" \
+    WINDOW_SIZE="$WINDOW_SIZE" WINDOW_ATTN_SKIP_FREQ="$WINDOW_ATTN_SKIP_FREQ" \
+    NO_ROPE_FREQ="$NO_ROPE_FREQ" \
     MEGATRON_PATH="$MEGATRON_PATH" STAGE1_ENV="$STAGE1_ENV" \
     TRUST_LEGACY_CHECKPOINT="$TRUST_LEGACY_CHECKPOINT" \
   sbatch --parsable --kill-on-invalid-dep=yes \
+    "${reservation_args[@]}" \
     --output="$LOG_DIR/%x-%j.log" --error="$LOG_DIR/%x-%j.log" \
     --export=ALL \
     "$SCRIPT_DIR/stage1_torchdist.sbatch" "$SOURCE_CHECKPOINT" "$OUTPUT_ROOT") \
@@ -222,6 +272,7 @@ stage2_job=$(env -u JOB_ID_FILE \
     EXTRA_EXPORT_ARGS="$EXTRA_EXPORT_ARGS" \
   sbatch --parsable --kill-on-invalid-dep=yes \
     --dependency="afterok:$stage1_job" \
+    "${reservation_args[@]}" "${stage2_partition_args[@]}" \
     --output="$LOG_DIR/%x-%j.log" --error="$LOG_DIR/%x-%j.log" \
     --export=ALL \
     "$SCRIPT_DIR/stage2_export.sbatch") \
