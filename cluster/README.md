@@ -22,7 +22,7 @@ torch_dist checkpoint ───────────────────�
 
 | Path | Role |
 | --- | --- |
-| `submit_chonk_120b_s1_iter1000.sh` | Pinned Stage 2 submission for the Chonk 120B checkpoint |
+| `convert.sh` | Submit Stage 2 for a `torch_dist` checkpoint |
 | `stage2_export.sbatch` | Inspect, size, export, verify, and certify a `torch_dist` checkpoint |
 | `submit_conversion.sh` | Validate and submit the two-job legacy conversion |
 | `stage1_torchdist.sbatch` | Load a legacy checkpoint with Megatron and save normalized `torch_dist` |
@@ -34,48 +34,24 @@ torch_dist checkpoint ───────────────────�
 | `container/build_container.sbatch` | Build the squashfs image referenced by the EDF |
 | `edf/apertus2-hf.toml` | Pyxis environment used by conversion and tests |
 
-## Chonk 120B
+## Stage 2
 
-The Chonk checkpoint is already a weight-only `torch_dist` checkpoint. Do not
-run Stage 1 for it.
-
-Run a Slurm preflight:
+For a `torch_dist` checkpoint, from the repository root:
 
 ```bash
-cd /iopsstor/scratch/cscs/mvasilev/hfconverter
-
-HF_OUT_DIR=/iopsstor/scratch/cscs/mvasilev/hf-export/chonk-120b-s1-iter1000-new \
-  cluster/submit_chonk_120b_s1_iter1000.sh --test-only
+cluster/convert.sh /path/to/torch_dist/iter_XXXXXXX /path/to/fresh-hf-output
 ```
 
-Submit:
+Arguments after the two paths go to sbatch (for example
+`--reservation=<name> --partition=normal`; a reservation belongs to exactly
+one partition, and `stage2_export.sbatch` defaults to `--partition=debug`, so
+set both together — read the partition off `scontrol show res <name>`).
+`TOKENIZER_DIR`, `VERIFY_LOAD` (default 0), `EXTRA_EXPORT_ARGS`, and `HF_ENV`
+are taken from the environment.
+
+With every knob explicit:
 
 ```bash
-HF_OUT_DIR=/iopsstor/scratch/cscs/mvasilev/hf-export/chonk-120b-s1-iter1000-new \
-  cluster/submit_chonk_120b_s1_iter1000.sh
-```
-
-The wrapper pins the source checkpoint, Apertus 200k tokenizer, container
-environment, 5 GB shard size, per-shard bitwise verification, and an allocation
-of 460,000 MiB. The full-model `from_pretrained()` reload is disabled. Its
-default output points at the completed reference model and is therefore
-intentionally unusable for a rerun unless `HF_OUT_DIR` is changed.
-
-The wrapper submits `VERIFY_LOAD=0` to avoid materializing the complete
-213.1 GiB model in CPU memory after export. Stage 2 still reloads every written
-shard and compares its values and dtypes bitwise. A successful result therefore
-has `"verified": true` and `"settings.verify_load": false` in
-`conversion_info.json`; the Stage 2 validator accepts that explicitly.
-
-The wrapper accepts overrides for `TD_ITER_DIR`, `TOKENIZER_DIR`, `HF_OUT_DIR`,
-`HF_ENV`, `LOG_DIR`, `PARTITION`, `TIME_LIMIT`, and `MEM_MIB`.
-
-## Generic Stage 2
-
-For another supported `torch_dist` checkpoint:
-
-```bash
-REPO=/iopsstor/scratch/cscs/mvasilev/hfconverter \
 TD_ITER_DIR=/path/to/torch_dist/iter_XXXXXXX \
 HF_OUT_DIR=/path/to/fresh-hf-output \
 TOKENIZER_DIR=/path/to/tokenizer \
@@ -124,10 +100,30 @@ MOE_AUX_LOSS_COEFF=1e-4 \
 INIT_METHOD_STD=0.0360844 \
 NORM_EPSILON=1e-5 \
 SANDWICH_NORM=0 \
+WINDOW_SIZE= \
+WINDOW_ATTN_SKIP_FREQ= \
+NO_ROPE_FREQ= \
   cluster/submit_conversion.sh \
     /path/to/legacy-checkpoint-root \
     /path/to/fresh-conversion-root
 ```
+
+`WINDOW_SIZE`, `WINDOW_ATTN_SKIP_FREQ` and `NO_ROPE_FREQ` are required to be
+*set*, though empty is a valid answer for a checkpoint that has none:
+Megatron's `--use-checkpoint-args` does not restore them, and neither
+sliding-window attention nor NoPE has a parameter footprint, so an omission
+would produce a model that loads, generates fluent text, and attends over the
+wrong span on every layer. `validate_source_profile.py` compares the supplied
+values against the checkpoint's own saved arguments before any job is
+submitted, so a forgotten flag is a refused submission rather than a wrong
+model. (Megatron's `window_size` is inclusive at both ends, so `(512, 0)`
+becomes `sliding_window` 513; Megatron's `no_rope_freq` marks the layers that
+*skip* the rotation while Hugging Face's `no_rope_layers` marks the layers
+that *keep* it — `exporter/config_from_args.py` performs both conversions.)
+
+`submit_conversion.sh` also takes `RESERVATION` and `STAGE2_PARTITION`, which
+must be set together; leaving both empty keeps each stage's own `#SBATCH`
+defaults.
 
 Do not copy those example values blindly. Inspect the source first:
 
@@ -230,8 +226,8 @@ for the next attempt. A valid Stage 2 result has:
 - no `.export_incomplete` marker;
 - source path and iteration matching the submitted checkpoint.
 
-The pinned Chonk submitter prints the job ID and exact log path. Generic jobs
-default to `cluster/logs/` when submitted through `submit_conversion.sh`.
+Jobs submitted through `submit_conversion.sh` default their logs to
+`cluster/logs/`.
 
 Run the conversion-focused test suite with:
 
