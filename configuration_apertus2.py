@@ -41,6 +41,9 @@ class Apertus2Config(PreTrainedConfig):
       shared expert still see the full ``hidden_size`` representation.
     - ``use_quantile_balancing`` selects experts from ``router_logits - qb_beta``.  It replaces
       correction-bias selection and cannot be combined with group-limited routing.
+    - ``attention_output_gate`` adds a per-channel sigmoid gate to every attention layer:
+      ``g_proj`` reads the same normalized input as Q/K/V and its sigmoid multiplies the
+      attention output right before ``o_proj``.  The gate skips QK-norm and RoPE.
     - ``embedding_multiplier`` scales token embeddings once, before the decoder stack.
     - ``residual_multiplier`` scales both attention and feed-forward branch outputs before they
       are added back to the residual stream.
@@ -111,6 +114,7 @@ class Apertus2Config(PreTrainedConfig):
     attention_bias: bool = False
     attention_dropout: float | int = 0.0
     use_qk_norm: bool = True
+    attention_output_gate: bool = False
     sliding_window: int | None = None
     layer_types: list[str] | None = None
     no_rope_layers: list[int] | None = None

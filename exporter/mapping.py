@@ -30,12 +30,13 @@ from typing import Any
 
 import torch
 
-from .transforms import split_gated_fc1, split_qkv
+from .transforms import split_gated_fc1, split_qkv, split_qkv_gate
 
 logger = logging.getLogger(__name__)
 
 COPY = "copy"
 SPLIT_QKV = "split_qkv"
+SPLIT_QKV_GATE = "split_qkv_gate"  # attention_output_gate: per-group [q, gate, k, v] blocks
 SPLIT_GATED_FC1 = "split_gated_fc1"
 EXPERTS_FC1 = "experts_slice_split_fc1"  # slice expert axis 0 -> split_gated_fc1 per expert
 EXPERTS_FC2 = "experts_slice_fc2"  # slice expert axis 0
@@ -131,6 +132,7 @@ class _Geometry:
     use_sandwich_norm: bool
     use_qk_norm: bool
     use_quantile_balancing: bool
+    use_attention_gate: bool
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "_Geometry":
@@ -167,6 +169,7 @@ class _Geometry:
             use_sandwich_norm=config["sandwich_norm"],
             use_qk_norm=config["use_qk_norm"],
             use_quantile_balancing=config["use_quantile_balancing"],
+            use_attention_gate=bool(config.get("attention_output_gate", False)),
         )
 
     @property
@@ -212,18 +215,36 @@ def _attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
             COPY,
             (hidden,),
         ),
-        # Megatron [(Q + 2*K)*D, H] -> HF q [Q*D,H], k [K*D,H], v [K*D,H].
-        Row(
-            f"{megatron}.self_attention.linear_qkv.weight",
-            (
-                f"{hf}.self_attn.q_proj.weight",
-                f"{hf}.self_attn.k_proj.weight",
-                f"{hf}.self_attn.v_proj.weight",
-            ),
-            SPLIT_QKV,
-            ((q_heads + 2 * kv_heads) * head_dim, hidden),
-        ),
     ]
+    if shape.use_attention_gate:
+        # Megatron [(2*Q + 2*K)*D, H] -> HF q [Q*D,H], g [Q*D,H], k [K*D,H], v [K*D,H].
+        rows.append(
+            Row(
+                f"{megatron}.self_attention.linear_qkv.weight",
+                (
+                    f"{hf}.self_attn.q_proj.weight",
+                    f"{hf}.self_attn.g_proj.weight",
+                    f"{hf}.self_attn.k_proj.weight",
+                    f"{hf}.self_attn.v_proj.weight",
+                ),
+                SPLIT_QKV_GATE,
+                ((2 * q_heads + 2 * kv_heads) * head_dim, hidden),
+            )
+        )
+    else:
+        # Megatron [(Q + 2*K)*D, H] -> HF q [Q*D,H], k [K*D,H], v [K*D,H].
+        rows.append(
+            Row(
+                f"{megatron}.self_attention.linear_qkv.weight",
+                (
+                    f"{hf}.self_attn.q_proj.weight",
+                    f"{hf}.self_attn.k_proj.weight",
+                    f"{hf}.self_attn.v_proj.weight",
+                ),
+                SPLIT_QKV,
+                ((q_heads + 2 * kv_heads) * head_dim, hidden),
+            )
+        )
     if shape.use_qk_norm:
         rows.extend(
             [
@@ -632,12 +653,14 @@ def plan_hf_tensors(plan: Plan, dtype: torch.dtype) -> list[HFTensorSpec]:
             specs.append(
                 HFTensorSpec(row.hf_keys[0], source_key, row.shape, output_dtype, COPY, 0)
             )
-        elif row.transform == SPLIT_QKV:
+        elif row.transform in (SPLIT_QKV, SPLIT_QKV_GATE):
             remaining_dimensions = row.shape[1:]  # (hidden,) for weights; empty for biases
+            query_rows = query_heads * head_dim
+            key_value_rows = key_value_heads * head_dim
             first_dimensions = (
-                query_heads * head_dim,
-                key_value_heads * head_dim,
-                key_value_heads * head_dim,
+                (query_rows, query_rows, key_value_rows, key_value_rows)  # q, gate, k, v
+                if row.transform == SPLIT_QKV_GATE
+                else (query_rows, key_value_rows, key_value_rows)
             )
             for part, first_dimension in enumerate(first_dimensions):
                 specs.append(
@@ -646,7 +669,7 @@ def plan_hf_tensors(plan: Plan, dtype: torch.dtype) -> list[HFTensorSpec]:
                         source_key,
                         (first_dimension, *remaining_dimensions),
                         output_dtype,
-                        SPLIT_QKV,
+                        row.transform,
                         part,
                     )
                 )
@@ -735,6 +758,8 @@ def produce_one(
         out = source
     elif spec.transform == SPLIT_QKV:
         out = split_qkv(source, num_q_heads, num_kv_heads, head_dim)[spec.part]
+    elif spec.transform == SPLIT_QKV_GATE:
+        out = split_qkv_gate(source, num_q_heads, num_kv_heads, head_dim)[spec.part]
     elif spec.transform == SPLIT_GATED_FC1:
         out = split_gated_fc1(source)[spec.part]
     elif spec.transform == EXPERTS_FC1:

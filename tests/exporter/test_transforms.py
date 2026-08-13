@@ -17,7 +17,7 @@ pytest.importorskip("megatron.core")
 
 import torch  # noqa: E402
 
-from exporter.transforms import split_gated_fc1, split_qkv  # noqa: E402
+from exporter.transforms import split_gated_fc1, split_qkv, split_qkv_gate  # noqa: E402
 
 HIDDEN = 32
 HEAD_DIM = 8
@@ -26,6 +26,7 @@ HEAD_DIM = 8
 Q_FILL = 1  # q head h -> Q_FILL + h
 K_FILL = 101  # kv group g -> K_FILL + g
 V_FILL = 201  # kv group g -> V_FILL + g
+G_FILL = 51  # gate head h -> G_FILL + h (attention_output_gate)
 
 
 def build_fused_qkv_2d(num_q_heads, num_kv_heads, head_dim=HEAD_DIM, hidden=HIDDEN,
@@ -136,6 +137,78 @@ class TestSplitQkv:
         fused = torch.randn(60, HIDDEN)  # (4 + 2*2) * 8 == 64 expected
         with pytest.raises((AssertionError, ValueError)):
             split_qkv(fused, 4, 2, HEAD_DIM)
+
+
+def build_fused_qkv_gate(num_q_heads, num_kv_heads, head_dim=HEAD_DIM, hidden=HIDDEN,
+                         dtype=torch.float32):
+    """Hand-built gated fork layout (attention.py "(2 * np/ng + 2) * hn"): per KV group,
+    heads_per_group q blocks, then heads_per_group gate blocks, then k, then v."""
+    heads_per_group = num_q_heads // num_kv_heads
+    blocks = []
+    for group in range(num_kv_heads):
+        for j in range(heads_per_group):
+            q_head = group * heads_per_group + j
+            blocks.append(torch.full((head_dim, hidden), float(Q_FILL + q_head), dtype=dtype))
+        for j in range(heads_per_group):
+            g_head = group * heads_per_group + j
+            blocks.append(torch.full((head_dim, hidden), float(G_FILL + g_head), dtype=dtype))
+        blocks.append(torch.full((head_dim, hidden), float(K_FILL + group), dtype=dtype))
+        blocks.append(torch.full((head_dim, hidden), float(V_FILL + group), dtype=dtype))
+    return torch.cat(blocks, dim=0)
+
+
+class TestSplitQkvGate:
+    @pytest.mark.parametrize("num_q_heads,num_kv_heads", GEOMETRIES)
+    def test_2d_weight_split(self, num_q_heads, num_kv_heads):
+        fused = build_fused_qkv_gate(num_q_heads, num_kv_heads)
+        q, g, k, v = split_qkv_gate(fused, num_q_heads, num_kv_heads, HEAD_DIM)
+        _assert_qkv_pieces(q, k, v, num_q_heads, num_kv_heads, HEAD_DIM, hidden=HIDDEN)
+        # gate blocks come out in the same global head order as query blocks
+        assert g.shape == (num_q_heads * HEAD_DIM, HIDDEN)
+        for head in range(num_q_heads):
+            block = g[head * HEAD_DIM : (head + 1) * HEAD_DIM]
+            assert torch.equal(block, torch.full_like(block, float(G_FILL + head))), (
+                f"gate head {head}"
+            )
+
+    def test_random_content_exact_row_gather(self):
+        torch.manual_seed(13)
+        num_q_heads, num_kv_heads, head_dim = 4, 2, HEAD_DIM
+        heads_per_group = num_q_heads // num_kv_heads
+        fused = torch.randn((2 * num_q_heads + 2 * num_kv_heads) * head_dim, HIDDEN)
+        q, g, k, v = split_qkv_gate(fused, num_q_heads, num_kv_heads, head_dim)
+        group_rows = (2 * heads_per_group + 2) * head_dim
+        q_rows = heads_per_group * head_dim
+        for group in range(num_kv_heads):
+            base = group * group_rows
+            assert torch.equal(q[group * q_rows : (group + 1) * q_rows], fused[base : base + q_rows])
+            assert torch.equal(
+                g[group * q_rows : (group + 1) * q_rows], fused[base + q_rows : base + 2 * q_rows]
+            )
+            assert torch.equal(
+                k[group * head_dim : (group + 1) * head_dim],
+                fused[base + 2 * q_rows : base + 2 * q_rows + head_dim],
+            )
+            assert torch.equal(
+                v[group * head_dim : (group + 1) * head_dim],
+                fused[base + 2 * q_rows + head_dim : base + group_rows],
+            )
+
+    def test_dtype_preserved_bf16(self):
+        fused = build_fused_qkv_gate(4, 2, dtype=torch.bfloat16)
+        q, g, k, v = split_qkv_gate(fused, 4, 2, HEAD_DIM)
+        assert q.dtype == g.dtype == k.dtype == v.dtype == torch.bfloat16
+
+    def test_rejects_ungated_row_total(self):
+        """A fused weight WITHOUT the gate must not slip through the gated split."""
+        fused = build_fused_qkv_2d(4, 2)  # (4 + 2*2) * 8 rows; gated expects (8 + 4) * 8
+        with pytest.raises((AssertionError, ValueError)):
+            split_qkv_gate(fused, 4, 2, HEAD_DIM)
+
+    def test_rejects_indivisible_head_counts(self):
+        fused = build_fused_qkv_gate(4, 2)
+        with pytest.raises((AssertionError, ValueError)):
+            split_qkv_gate(fused, 4, 3, HEAD_DIM)
 
 
 class TestSplitGatedFc1:

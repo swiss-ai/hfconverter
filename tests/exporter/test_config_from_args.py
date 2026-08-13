@@ -311,6 +311,17 @@ class TestDerivations:
         )
         assert expert_bias_present is enabled
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_attention_output_gate_is_derived(self, enabled):
+        config = derive_config(good_args(attention_output_gate=enabled))
+        assert config.attention_output_gate is enabled
+
+    def test_attention_output_gate_absent_from_args_defaults_off(self):
+        args = good_args()
+        delattr(args, "attention_output_gate")
+        config = derive_config(args)
+        assert config.attention_output_gate is False
+
     def test_mtp_num_layers_zero_is_accepted(self):
         derive_config(good_args(mtp_num_layers=0))
 
@@ -339,7 +350,6 @@ HARD_ASSERT_CASES = [
     ("moe_router_score_function", "softmax", "moe_router_score_function"),
     ("moe_router_topk_limited_devices", 1, "moe_router_topk_limited_devices"),
     ("moe_shared_expert_gate", True, "moe_shared_expert_gate"),
-    ("attention_output_gate", True, "attention_output_gate"),
     ("softmax_scale", 0.125, "softmax_scale"),
     ("apply_query_key_layer_scaling", True, "apply_query_key_layer_scaling"),
     # Sliding-window attention IS supported; a right-hand context is not, because a causal

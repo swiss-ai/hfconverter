@@ -225,6 +225,29 @@ def merge_qkv(q, k, v, num_q_heads, num_kv_heads, head_dim):
     return torch.cat(blocks, dim=0)
 
 
+def merge_qkv_gate(q, g, k, v, num_q_heads, num_kv_heads, head_dim):
+    """HF q/g/k/v projections -> fork fused qkv with attention_output_gate.
+
+    Per KV group the fork stores [q...q, g...g, k, v] blocks: one gate block per query head,
+    ordered like the query blocks, between the queries and the key (attention.py's
+    "(2 * np/ng + 2) * hn" layout). Implemented independently of exporter.transforms.
+    """
+    assert num_q_heads % num_kv_heads == 0, (num_q_heads, num_kv_heads)
+    heads_per_group = num_q_heads // num_kv_heads
+    assert q.shape == g.shape, (q.shape, g.shape)
+    assert q.shape[0] == num_q_heads * head_dim, (q.shape, num_q_heads, head_dim)
+    assert k.shape[0] == num_kv_heads * head_dim, (k.shape, num_kv_heads, head_dim)
+    assert v.shape[0] == num_kv_heads * head_dim, (v.shape, num_kv_heads, head_dim)
+    blocks = []
+    for group in range(num_kv_heads):
+        q_start = group * heads_per_group * head_dim
+        blocks.append(q[q_start : q_start + heads_per_group * head_dim])
+        blocks.append(g[q_start : q_start + heads_per_group * head_dim])
+        blocks.append(k[group * head_dim : (group + 1) * head_dim])
+        blocks.append(v[group * head_dim : (group + 1) * head_dim])
+    return torch.cat(blocks, dim=0)
+
+
 def merge_gate_up(gate, up):
     """HF gate/up projections -> fork fused fc1 rows [gate; up], gate first."""
     assert gate.shape == up.shape, (gate.shape, up.shape)
@@ -267,14 +290,25 @@ def to_megatron_tensors(model, config=None, expert_bias_present=True):
         out[mg + "self_attention.linear_qkv.layer_norm_weight"] = _grab(
             state_dict, hf + "attention_layernorm.weight"
         )
-        out[mg + "self_attention.linear_qkv.weight"] = merge_qkv(
-            _grab(state_dict, hf + "self_attn.q_proj.weight"),
-            _grab(state_dict, hf + "self_attn.k_proj.weight"),
-            _grab(state_dict, hf + "self_attn.v_proj.weight"),
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-        )
+        if getattr(config, "attention_output_gate", False):
+            out[mg + "self_attention.linear_qkv.weight"] = merge_qkv_gate(
+                _grab(state_dict, hf + "self_attn.q_proj.weight"),
+                _grab(state_dict, hf + "self_attn.g_proj.weight"),
+                _grab(state_dict, hf + "self_attn.k_proj.weight"),
+                _grab(state_dict, hf + "self_attn.v_proj.weight"),
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+            )
+        else:
+            out[mg + "self_attention.linear_qkv.weight"] = merge_qkv(
+                _grab(state_dict, hf + "self_attn.q_proj.weight"),
+                _grab(state_dict, hf + "self_attn.k_proj.weight"),
+                _grab(state_dict, hf + "self_attn.v_proj.weight"),
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+            )
         out[mg + "self_attention.q_layernorm.weight"] = _grab(
             state_dict, hf + "self_attn.q_norm.weight"
         )
@@ -462,6 +496,7 @@ def make_args_namespace(config, expert_bias_present=True, **overrides):
         glu_linear_offset=0.0,
         activation_func_clamp_value=None,
         qk_layernorm=config.use_qk_norm,
+        attention_output_gate=bool(getattr(config, "attention_output_gate", False)),
         sandwich_norm=config.sandwich_norm,
         # biases
         add_bias_linear=False,
@@ -482,7 +517,6 @@ def make_args_namespace(config, expert_bias_present=True, **overrides):
         mtp_num_layers=None,
         pnglu=False,
         use_mup=False,
-        attention_output_gate=False,
         softmax_scale=None,
         apply_query_key_layer_scaling=False,
         window_size=None,

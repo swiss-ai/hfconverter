@@ -173,6 +173,10 @@ class Apertus2Attention(nn.Module):
     ``no_rope_layers[layer_idx]`` decides whether its queries and keys are rotated at all.
     ``sliding_window`` is forwarded to the attention backend as well as shaping the mask,
     because the flash-attention path carries the window in that keyword and nowhere else.
+
+    With ``attention_output_gate``, a fourth projection ``g_proj`` (fused with Q/K/V in the
+    Megatron checkpoint) reads the same normalized input and its sigmoid multiplies the
+    attention output channelwise before ``o_proj``.  The gate is never normalized or rotated.
     """
 
     def __init__(self, config: Apertus2Config, layer_idx: int | None = None):
@@ -201,6 +205,13 @@ class Apertus2Attention(nn.Module):
             config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+        self.attention_output_gate = config.attention_output_gate
+        if self.attention_output_gate:
+            # One gate channel per query-head channel, ordered exactly like q_proj rows so the
+            # flat [B, S, Q * D] gate lines up with the attention output it multiplies.
+            self.g_proj = nn.Linear(
+                config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+            )
         self.use_qk_norm = config.use_qk_norm
         if self.use_qk_norm:
             self.q_norm = Apertus2RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -260,6 +271,11 @@ class Apertus2Attention(nn.Module):
 
         # [B, S, Q, D] -> [B, S, Q * D] -> [B, S, H].
         attention_output = attention_output.reshape(*input_shape, -1).contiguous()
+        if self.attention_output_gate:
+            # Megatron's _apply_output_gate: sigmoid in fp32, result cast back to the working
+            # dtype. The gate reads the block's normalized input, not the attention output.
+            gate = self.g_proj(hidden_states)
+            attention_output = (attention_output * torch.sigmoid(gate.float())).to(attention_output.dtype)
         attention_output = self.o_proj(attention_output)
         return attention_output, attention_weights
 

@@ -42,7 +42,9 @@ splitting, Q/K normalization, dense fused gate/up projections, routed experts,
 shared experts, expert latent projections, router weights and buffers, and
 post-branch norms. Offloaded expert checkpoints are converted from their fused,
 transposed `weight1`/`weight2` representation into the stacked Hugging Face
-expert tensors.
+expert tensors. With `attention_output_gate` the fused QKV weight also carries
+one gate block per query head (per KV group `[q..., gate..., k, v]`); the gate
+blocks become `self_attn.g_proj.weight`, ordered exactly like the query rows.
 
 Splits and transposes change tensor layout but not values. Every source model
 key must be consumed exactly once and every expected Hugging Face key must be

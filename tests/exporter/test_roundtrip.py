@@ -186,6 +186,42 @@ class TestRoundtrip:
             saved = json.load(handle)
         assert saved["moe_layer_freq"] == pattern
 
+    def test_attention_output_gate_round_trips_bitwise(self, dist_env, export_api, tmp_path):
+        """Gated attention: the fused QKV carries an extra per-query-head gate slice that must
+        come back bitwise as self_attn.g_proj on every layer."""
+        model, checkpoint_dir = _build_and_save(
+            tmp_path,
+            sandwich=True,
+            latent=24,
+            qb=True,
+            expert_bias=True,
+            attention_output_gate=True,
+        )
+        output_dir = tmp_path / "hf_gated"
+        export_api(checkpoint_dir, output_dir)
+
+        reloaded, info = Apertus2ForCausalLM.from_pretrained(
+            str(output_dir), dtype=torch.float32, output_loading_info=True
+        )
+        assert not any(info.values()), info
+        assert reloaded.config.attention_output_gate is True
+
+        source_state = model.state_dict()
+        restored_state = reloaded.state_dict()
+        assert set(source_state) == set(restored_state), (
+            sorted(set(source_state) ^ set(restored_state))
+        )
+        gate_keys = [key for key in restored_state if key.endswith("self_attn.g_proj.weight")]
+        assert len(gate_keys) == model.config.num_hidden_layers, gate_keys
+        for key, source in source_state.items():
+            restored = restored_state[key]
+            assert restored.dtype == source.dtype, key
+            assert torch.equal(restored, source), key
+
+        with open(output_dir / "config.json") as handle:
+            saved = json.load(handle)
+        assert saved["attention_output_gate"] is True
+
     def test_output_dir_must_not_exist_or_be_empty(self, dist_env, export_api, tmp_path):
         _, checkpoint_dir = _build_and_save(tmp_path, False, None, False, True)
         output_dir = tmp_path / "occupied"

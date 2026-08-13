@@ -472,12 +472,6 @@ def _validate_router_and_attention(args: Namespace, support: _SupportBoundary) -
         capacity_factor,
     )
 
-    attention_output_gate = getattr(args, "attention_output_gate", False)
-    support.require(
-        not attention_output_gate,
-        "args.attention_output_gate is falsy",
-        attention_output_gate,
-    )
     softmax_scale = getattr(args, "softmax_scale", None)
     support.require(softmax_scale is None, "args.softmax_scale is None", softmax_scale)
     query_key_layer_scaling = getattr(args, "apply_query_key_layer_scaling", False)
@@ -676,6 +670,11 @@ def derive_config(args: Namespace) -> DerivedConfig:
         use_quantile_balancing=use_quantile_balancing,
     )
 
+    # The gate widens the fused QKV weight, so a wrong value here is also caught later by the
+    # shape validation; deriving it (rather than defaulting) keeps config.json authoritative.
+    attention_output_gate = bool(getattr(args, "attention_output_gate", False))
+    support.passed.append(f"args.attention_output_gate = {attention_output_gate}")
+
     scale_embeddings = bool(_req(args, "scale_embeddings_by_sqrt_hidden"))
     scale_residuals = bool(_req(args, "residual_output_scaling"))
     embedding_multiplier = math.sqrt(hidden_size) if scale_embeddings else 1.0
@@ -708,6 +707,7 @@ def derive_config(args: Namespace) -> DerivedConfig:
         "attention_dropout": _req(args, "attention_dropout"),
         "initializer_range": _req(args, "init_method_std"),
         "use_qk_norm": bool(_req(args, "qk_layernorm")),
+        "attention_output_gate": attention_output_gate,
         "sandwich_norm": bool(_req(args, "sandwich_norm")),
         "moe_latent_size": _req(args, "moe_latent_size"),
         "use_quantile_balancing": use_quantile_balancing,

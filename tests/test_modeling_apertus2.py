@@ -139,6 +139,8 @@ def _expected_disk_keys(config):
         keys.add(p + "feedforward_layernorm.weight")
         for proj in ("q", "k", "v", "o"):
             keys.add(p + f"self_attn.{proj}_proj.weight")
+        if config.attention_output_gate:
+            keys.add(p + "self_attn.g_proj.weight")
         keys.add(p + "self_attn.q_norm.weight")
         keys.add(p + "self_attn.k_norm.weight")
         if config.sandwich_norm:
@@ -1188,6 +1190,73 @@ class TestQkNormPlacement:
             a = q_norm(x).transpose(1, 2)
             b = q_norm(x.transpose(1, 2))
         torch.testing.assert_close(a, b, rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# attention output gate: module existence + the fork's gate math contract
+# ---------------------------------------------------------------------------
+
+
+class TestAttentionOutputGate:
+    """Megatron's gated attention (attention_output_gate): g_proj reads the block's
+    normalized input, its fp32 sigmoid multiplies the attention output channelwise, and
+    o_proj runs after the gate."""
+
+    def test_flag_off_no_g_proj_anywhere(self, make_model):
+        model = make_model(False, None)
+        assert not any("g_proj" in name for name, _ in model.named_parameters())
+
+    def test_flag_on_g_proj_on_every_layer(self, make_model):
+        model = make_model(False, None, attention_output_gate=True)
+        for layer in model.model.layers:
+            weight = layer.self_attn.g_proj.weight
+            assert tuple(weight.shape) == (TINY_HEADS * TINY_HEAD_DIM, TINY_HIDDEN)
+
+    def test_forward_smoke_gated(self, make_model, input_ids):
+        model = make_model(True, TINY_LATENT, attention_output_gate=True)
+        with torch.no_grad():
+            out = model(input_ids)
+        assert out.logits.shape == (2, 7, TINY_VOCAB)
+        assert torch.isfinite(out.logits).all()
+
+    def test_zero_gate_weights_halve_the_ungated_output(self, make_model):
+        """sigmoid(0) = 0.5 and o_proj is linear without bias, so a zeroed g_proj must return
+        exactly half of the gate-bypassed output. This pins the gate AFTER the attention core
+        and BEFORE o_proj."""
+        model = make_model(False, None, attention_output_gate=True)
+        attn = model.model.layers[0].self_attn
+        with torch.no_grad():
+            attn.g_proj.weight.zero_()
+        x = torch.randn(2, 5, TINY_HIDDEN)
+        pos_emb = _rope(model, x)
+        with torch.no_grad():
+            gated = _as_tensor(attn(x, pos_emb, None))
+            attn.attention_output_gate = False  # bypass only the gate multiplication
+            ungated = _as_tensor(attn(x, pos_emb, None))
+        torch.testing.assert_close(gated, 0.5 * ungated, rtol=1e-6, atol=1e-6)
+
+    def test_gate_reads_the_block_input_and_multiplies_before_o_proj(self, make_model):
+        """Full composition: out == o_proj(context * sigmoid(g_proj(x))), with g_proj applied
+        to the layer INPUT x. The context is captured through the module's own ungated path
+        with o_proj temporarily replaced by identity."""
+        model = make_model(False, None, attention_output_gate=True)
+        attn = model.model.layers[0].self_attn
+        with torch.no_grad():
+            attn.g_proj.weight.copy_(torch.randn_like(attn.g_proj.weight))
+        x = torch.randn(2, 5, TINY_HIDDEN)
+        pos_emb = _rope(model, x)
+        with torch.no_grad():
+            gated = _as_tensor(attn(x, pos_emb, None))
+
+            o_proj = attn.o_proj
+            attn.o_proj = torch.nn.Identity()
+            attn.attention_output_gate = False
+            context = _as_tensor(attn(x, pos_emb, None))  # [B, S, Q*D] before o_proj
+            attn.o_proj = o_proj
+            attn.attention_output_gate = True
+
+            expected = o_proj(context * torch.sigmoid(attn.g_proj(x).float()))
+        torch.testing.assert_close(gated, expected, rtol=1e-6, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
