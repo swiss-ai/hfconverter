@@ -25,6 +25,17 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 
+QUANTILE_BALANCING_METHODS = ("sigmoid", "legacy")
+# Megatron names its training-time quantile estimators; after export only the selection score
+# space matters, so the estimator names collapse onto the two canonical methods.
+QUANTILE_BALANCING_ALIASES = {
+    "average": "sigmoid",
+    "histogram": "sigmoid",
+    "legacy_average": "legacy",
+}
+QUANTILE_BALANCING_CHOICES = QUANTILE_BALANCING_METHODS + tuple(QUANTILE_BALANCING_ALIASES)
+
+
 class DerivedConfig(NamedTuple):
     kwargs: dict[str, Any]
     expert_bias_present: bool
@@ -588,7 +599,72 @@ def _derive_expert_storage(args: Namespace, support: _SupportBoundary) -> bool:
     return True
 
 
-def derive_config(args: Namespace) -> DerivedConfig:
+def _derive_quantile_balancing_method(
+    args: Namespace,
+    support: _SupportBoundary,
+    *,
+    enabled: bool,
+    override: str | None,
+) -> str:
+    """Resolve the QB selection score space for the exported config.
+
+    ``sigmoid`` (selection from ``sigmoid(logits) - qb_beta``) is the default: it covers every
+    current Megatron estimator (``average``/``histogram``), including checkpoints whose args
+    omit the field because the fork never persisted its dataclass default.  Early raw-logit
+    checkpoints must be exported with an explicit
+    ``--moe-router-quantile-balancing-method=legacy``.
+    """
+    saved_raw = getattr(args, "moe_router_quantile_balancing_method", None)
+    if not enabled:
+        override_note = " (explicit override ignored)" if override is not None else ""
+        support.passed.append(
+            "quantile balancing is disabled; moe_router_quantile_balancing_method is inactive"
+            f"{override_note}"
+        )
+        return "sigmoid"
+
+    saved = QUANTILE_BALANCING_ALIASES.get(saved_raw, saved_raw)
+    resolved_override = QUANTILE_BALANCING_ALIASES.get(override, override)
+    for label, raw, resolved in (
+        ("args.moe_router_quantile_balancing_method", saved_raw, saved),
+        ("the --moe-router-quantile-balancing-method override", override, resolved_override),
+    ):
+        support.require(
+            raw is None or resolved in QUANTILE_BALANCING_METHODS,
+            f"{label} is one of {QUANTILE_BALANCING_CHOICES!r} when set",
+            raw,
+        )
+    if saved is not None and resolved_override is not None and saved != resolved_override:
+        raise ValueError(
+            "moe_router_quantile_balancing_method override conflicts with checkpoint metadata: "
+            f"override={override!r} (-> {resolved_override!r}), "
+            f"args value={saved_raw!r} (-> {saved!r})"
+        )
+
+    if resolved_override is not None:
+        support.passed.append(
+            f"explicit exporter override: moe_router_quantile_balancing_method = {override!r} "
+            f"-> {resolved_override!r}"
+        )
+        return resolved_override
+    if saved is not None:
+        support.passed.append(
+            f"checkpoint args: moe_router_quantile_balancing_method = {saved_raw!r} -> {saved!r}"
+        )
+        return saved
+    support.passed.append(
+        "checkpoint args omit moe_router_quantile_balancing_method; defaulting to 'sigmoid' "
+        "selection (early raw-logit checkpoints need "
+        "--moe-router-quantile-balancing-method=legacy)"
+    )
+    return "sigmoid"
+
+
+def derive_config(
+    args: Namespace,
+    *,
+    moe_router_quantile_balancing_method: str | None = None,
+) -> DerivedConfig:
     """Validate checkpoint support and derive the Hugging Face configuration."""
     support = _SupportBoundary()
     num_layers = _req(args, "num_layers")
@@ -662,6 +738,12 @@ def derive_config(args: Namespace) -> DerivedConfig:
         balancing,
     )
     use_quantile_balancing = "quantile_balancing" in balancing_methods
+    quantile_balancing_method = _derive_quantile_balancing_method(
+        args,
+        support,
+        enabled=use_quantile_balancing,
+        override=moe_router_quantile_balancing_method,
+    )
     n_group, topk_group = _derive_group_limits(
         args,
         support,
@@ -711,6 +793,7 @@ def derive_config(args: Namespace) -> DerivedConfig:
         "sandwich_norm": bool(_req(args, "sandwich_norm")),
         "moe_latent_size": _req(args, "moe_latent_size"),
         "use_quantile_balancing": use_quantile_balancing,
+        "moe_router_quantile_balancing_method": quantile_balancing_method,
         "embedding_multiplier": embedding_multiplier,
         "residual_multiplier": residual_multiplier,
         "tie_word_embeddings": False,

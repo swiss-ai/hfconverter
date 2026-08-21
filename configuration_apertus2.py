@@ -39,8 +39,12 @@ class Apertus2Config(PreTrainedConfig):
       ``x + residual_multiplier * post_norm(branch(pre_norm(x)))``.
     - ``moe_latent_size`` makes routed experts work in a smaller feature space.  The router and
       shared expert still see the full ``hidden_size`` representation.
-    - ``use_quantile_balancing`` selects experts from ``router_logits - qb_beta``.  It replaces
-      correction-bias selection and cannot be combined with group-limited routing.
+    - ``use_quantile_balancing`` subtracts ``qb_beta`` before expert selection.  The
+      ``moe_router_quantile_balancing_method`` chooses its score space: ``sigmoid`` (the
+      default) selects from sigmoid router scores, ``legacy`` from raw router logits.
+      Megatron's training-time estimator names are accepted and normalized on load
+      (``average``/``histogram`` -> ``sigmoid``, ``legacy_average`` -> ``legacy``).  QB
+      replaces correction-bias selection and cannot be combined with group-limited routing.
     - ``attention_output_gate`` adds a per-channel sigmoid gate to every attention layer:
       ``g_proj`` reads the same normalized input as Q/K/V and its sigmoid multiplies the
       attention output right before ``o_proj``.  The gate skips QK-norm and RoPE.
@@ -131,6 +135,11 @@ class Apertus2Config(PreTrainedConfig):
     sandwich_norm: bool = False
     moe_latent_size: int | None = None
     use_quantile_balancing: bool = False
+    # Score space for QB expert selection; "legacy" keeps the raw-logit selection of the earliest
+    # QB exports.  Exports from that era bundle their own modeling code, so the modern sigmoid
+    # space is the default here; loading such an old field-less config.json with THIS code
+    # requires setting the field to "legacy" explicitly.
+    moe_router_quantile_balancing_method: str = "sigmoid"
     embedding_multiplier: float = 27.712812921102035
     residual_multiplier: float = 0.22360679774997896
     pad_token_id: int | None = 3
@@ -165,6 +174,25 @@ class Apertus2Config(PreTrainedConfig):
 
     def _validate_router_options(self) -> None:
         """Ensure Hugging Face routing performs the same math as the Megatron model."""
+        if self.use_quantile_balancing:
+            # Megatron names its training-time quantile estimators; inference only needs the
+            # selection score space, so the estimator names collapse onto the canonical pair.
+            aliases = {
+                "average": "sigmoid",
+                "histogram": "sigmoid",
+                "legacy_average": "legacy",
+            }
+            method = aliases.get(
+                self.moe_router_quantile_balancing_method,
+                self.moe_router_quantile_balancing_method,
+            )
+            if method not in ("sigmoid", "legacy"):
+                raise ValueError(
+                    "moe_router_quantile_balancing_method must be 'sigmoid' or 'legacy' "
+                    "(Megatron spellings 'average', 'histogram', and 'legacy_average' are also "
+                    f"accepted); got {self.moe_router_quantile_balancing_method!r}."
+                )
+            self.moe_router_quantile_balancing_method = method
         # Megatron normalizes selected weights exactly when more than one expert is selected.
         if self.num_experts_per_tok == 1 and self.norm_topk_prob:
             raise ValueError(

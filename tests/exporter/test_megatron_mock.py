@@ -282,6 +282,7 @@ REQUIRED_ARGS_ATTRS = [
     "moe_layer_freq",
     "moe_latent_size",
     "moe_router_load_balancing_type",
+    "moe_router_quantile_balancing_method",
     "moe_router_topk_scaling_factor",
     "moe_router_score_function",
     "moe_router_enable_expert_bias",
@@ -372,6 +373,8 @@ class TestArgsNamespace:
         config = megatron_mock.tiny_export_config(False, None, True)
         args = megatron_mock.make_args_namespace(config, expert_bias_present=True)
         assert args.moe_router_load_balancing_type == ["seq_aux_loss", "quantile_balancing"]
+        # The config's canonical "sigmoid" score space maps back to the fork's estimator name.
+        assert args.moe_router_quantile_balancing_method == "histogram"
 
     def test_expert_bias_and_overrides(self):
         config = megatron_mock.tiny_export_config(False, None, False)

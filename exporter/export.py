@@ -147,11 +147,18 @@ def _plan_source_residency(
 
 
 def _prepare_export(
-    checkpoint_dir: Path, max_shard_size: int | str, strict_optimizer: bool
+    checkpoint_dir: Path,
+    max_shard_size: int | str,
+    strict_optimizer: bool,
+    *,
+    moe_router_quantile_balancing_method: str | None = None,
 ) -> _PreparedExport:
     """Stages 1-2: inspect Megatron metadata and plan every Hugging Face output tensor."""
     checkpoint_args, common_state = reader.load_args(checkpoint_dir)
-    derived = config_from_args.derive_config(checkpoint_args)
+    derived = config_from_args.derive_config(
+        checkpoint_args,
+        moe_router_quantile_balancing_method=moe_router_quantile_balancing_method,
+    )
     checks = list(derived.checks)
     logger.info(
         "1/4 read config: %d checks; layers=%d hidden=%d experts=%d",
@@ -328,6 +335,7 @@ def _finish_hf_directory(
     checkpoint_dir: Path,
     max_shard_size: int | str,
     strict_optimizer: bool,
+    moe_router_quantile_balancing_method: str | None,
 ) -> None:
     """Stage 4: write HF support files, perform final verification, and certify completion."""
     token_ids = {}
@@ -371,6 +379,9 @@ def _finish_hf_directory(
             "verify_load": verify_load,
             "strict_optimizer": strict_optimizer,
             "tokenizer_dir": str(tokenizer_dir) if tokenizer_dir is not None else None,
+            "moe_router_quantile_balancing_method_override": (
+                moe_router_quantile_balancing_method
+            ),
         },
     )
 
@@ -384,6 +395,7 @@ def export_checkpoint(
     verify: bool = True,
     verify_load: bool = False,
     strict_optimizer: bool = False,
+    moe_router_quantile_balancing_method: str | None = None,
 ) -> ExportSummary:
     """Convert one Megatron ``torch_dist`` checkpoint into a Hugging Face directory.
 
@@ -393,7 +405,12 @@ def export_checkpoint(
     checkpoint_path = Path(checkpoint_dir)
     output_path = Path(output_dir)
     _validate_paths(checkpoint_path, output_path, tokenizer_dir)
-    prepared = _prepare_export(checkpoint_path, max_shard_size, strict_optimizer)
+    prepared = _prepare_export(
+        checkpoint_path,
+        max_shard_size,
+        strict_optimizer,
+        moe_router_quantile_balancing_method=moe_router_quantile_balancing_method,
+    )
 
     claim = output_claim.claim_output_dir(output_path)
     # A failure after claiming deliberately leaves the marker and any partial files for diagnosis.
@@ -408,6 +425,7 @@ def export_checkpoint(
         checkpoint_dir=checkpoint_path,
         max_shard_size=max_shard_size,
         strict_optimizer=strict_optimizer,
+        moe_router_quantile_balancing_method=moe_router_quantile_balancing_method,
     )
     output_claim.release_output_claim(claim)
 
@@ -448,6 +466,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="additionally from_pretrained() the export and compare bitwise (heavy)")
     parser.add_argument("--strict-optimizer", action="store_true",
                         help="fail instead of dropping optimizer.*/opt_param_scheduler keys")
+    parser.add_argument(
+        "--moe-router-quantile-balancing-method",
+        choices=config_from_args.QUANTILE_BALANCING_CHOICES,
+        default=None,
+        help=(
+            "score space for quantile-balancing expert selection; default is sigmoid "
+            "(sigmoid(logits) - qb_beta), which matches every current Megatron estimator even "
+            "when checkpoint args omit the method. Pass 'legacy' for early raw-logit "
+            "checkpoints (logits - qb_beta). Megatron estimator names average/histogram/"
+            "legacy_average are accepted and normalized"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="stderr logging level; DEBUG adds full tracebacks on failure")
@@ -471,6 +501,9 @@ def main(argv: list[str] | None = None) -> int:
             verify=not ns.no_verify,
             verify_load=ns.verify_load,
             strict_optimizer=ns.strict_optimizer,
+            moe_router_quantile_balancing_method=(
+                ns.moe_router_quantile_balancing_method
+            ),
         )
     except Exception as exc:  # clean error, no traceback spam (traceback at DEBUG)
         logger.debug("export failed with traceback:", exc_info=True)

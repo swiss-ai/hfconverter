@@ -475,6 +475,12 @@ def make_args_namespace(config, expert_bias_present=True, **overrides):
         moe_layer_freq=moe_layer_freq,
         moe_latent_size=config.moe_latent_size,
         moe_router_load_balancing_type=load_balancing,
+        # A real fork persists its estimator name, not the HF score-space value; translating
+        # back makes every synthetic checkpoint exercise the exporter's alias normalization.
+        moe_router_quantile_balancing_method={
+            "sigmoid": "histogram",
+            "legacy": "legacy_average",
+        }[config.moe_router_quantile_balancing_method],
         moe_router_topk_scaling_factor=config.routed_scaling_factor,
         moe_router_score_function="sigmoid",
         # as in the real 1.5b run: mcore's DEFAULT is None (router computes in the activation

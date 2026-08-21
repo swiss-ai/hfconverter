@@ -62,9 +62,9 @@ def _entry_point():
     )
 
 
-def derive(args):
+def derive(args, **kwargs):
     """-> (kwargs: dict, expert_bias_present: bool | None, raw_result)."""
-    result = _entry_point()(args)
+    result = _entry_point()(args, **kwargs)
     if isinstance(result, dict):
         return result, None, result
     if isinstance(result, tuple):
@@ -82,8 +82,8 @@ def derive(args):
     raise AssertionError(f"unrecognized config_from_args result shape: {type(result)}")
 
 
-def derive_config(args):
-    kwargs, _, _ = derive(args)
+def derive_config(args, **kwargs):
+    kwargs, _, _ = derive(args, **kwargs)
     return Apertus2Config(**kwargs)
 
 
@@ -124,6 +124,7 @@ class TestDerivations:
         assert config.sandwich_norm is False
         assert config.moe_latent_size is None
         assert config.use_quantile_balancing is False
+        assert config.moe_router_quantile_balancing_method == "sigmoid"
         assert config.tie_word_embeddings is False
         assert config.norm_topk_prob is True
         assert config.n_group == 1 and config.topk_group == 1
@@ -136,6 +137,7 @@ class TestDerivations:
         assert config.sandwich_norm is True
         assert config.moe_latent_size == 24
         assert config.use_quantile_balancing is True
+        assert config.moe_router_quantile_balancing_method == "sigmoid"
 
     def test_topk_one_disables_probability_renormalization(self):
         config = derive_config(good_args(moe_router_topk=1))
@@ -301,6 +303,56 @@ class TestDerivations:
     def test_quantile_balancing_detection(self, balancing, expected_qb):
         config = derive_config(good_args(moe_router_load_balancing_type=balancing))
         assert config.use_quantile_balancing is expected_qb
+
+    @pytest.mark.parametrize(
+        "saved, expected",
+        [
+            ("sigmoid", "sigmoid"),
+            ("legacy", "legacy"),
+            ("average", "sigmoid"),
+            ("histogram", "sigmoid"),
+            ("legacy_average", "legacy"),
+        ],
+    )
+    def test_quantile_balancing_method_is_normalized_and_preserved(self, saved, expected):
+        config = derive_config(
+            good_args(qb=True, moe_router_quantile_balancing_method=saved)
+        )
+        assert config.moe_router_quantile_balancing_method == expected
+
+    def test_missing_qb_method_defaults_to_sigmoid(self):
+        args = good_args(qb=True)
+        delattr(args, "moe_router_quantile_balancing_method")
+        config = derive_config(args)
+        assert config.moe_router_quantile_balancing_method == "sigmoid"
+
+        config = derive_config(args, moe_router_quantile_balancing_method="legacy")
+        assert config.moe_router_quantile_balancing_method == "legacy"
+
+    def test_qb_method_override_cannot_contradict_checkpoint_metadata(self):
+        args = good_args(qb=True, moe_router_quantile_balancing_method="histogram")
+        with pytest.raises(ValueError, match="conflicts with checkpoint metadata"):
+            derive_config(args, moe_router_quantile_balancing_method="legacy")
+
+    def test_qb_method_override_may_restate_checkpoint_metadata(self):
+        # "histogram" and "sigmoid" name the same score space, so this is not a conflict.
+        args = good_args(qb=True, moe_router_quantile_balancing_method="histogram")
+        config = derive_config(args, moe_router_quantile_balancing_method="sigmoid")
+        assert config.moe_router_quantile_balancing_method == "sigmoid"
+
+    def test_qb_method_override_is_ignored_when_qb_is_disabled(self):
+        config = derive_config(
+            good_args(qb=False),
+            moe_router_quantile_balancing_method="legacy",
+        )
+        assert config.use_quantile_balancing is False
+        assert config.moe_router_quantile_balancing_method == "sigmoid"
+
+    def test_invalid_qb_method_is_rejected(self):
+        with pytest.raises(ValueError, match="moe_router_quantile_balancing_method"):
+            derive_config(
+                good_args(qb=True, moe_router_quantile_balancing_method="unknown")
+            )
 
     @pytest.mark.parametrize("enabled", [True, False])
     def test_expert_bias_present_returned_alongside(self, enabled):

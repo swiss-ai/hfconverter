@@ -208,6 +208,8 @@ class TestContractPlumbing:
         assert cfg.topk_group == 1
         assert cfg.sandwich_norm is False
         assert cfg.moe_latent_size is None
+        assert cfg.use_quantile_balancing is False
+        assert cfg.moe_router_quantile_balancing_method == "sigmoid"
         assert cfg.embedding_multiplier == EMBEDDING_MULTIPLIER
         assert cfg.residual_multiplier == RESIDUAL_MULTIPLIER
         assert cfg.initializer_range == 0.02
@@ -232,6 +234,30 @@ class TestContractPlumbing:
 
     def test_untied_by_default(self):
         assert Apertus2Config().tie_word_embeddings is False
+
+    def test_qb_config_without_method_defaults_to_sigmoid(self):
+        # Field-less configs default to the modern sigmoid score space.  Exports from the
+        # raw-logit era bundle their own modeling code and are unaffected; loading one with
+        # THIS code requires setting the method to "legacy" explicitly.
+        config = Apertus2Config(use_quantile_balancing=True).to_dict()
+        config.pop("moe_router_quantile_balancing_method")
+        restored = Apertus2Config.from_dict(config)
+        assert restored.use_quantile_balancing is True
+        assert restored.moe_router_quantile_balancing_method == "sigmoid"
+
+    @pytest.mark.parametrize(
+        "stored, expected",
+        [
+            ("average", "sigmoid"),
+            ("histogram", "sigmoid"),
+            ("legacy_average", "legacy"),
+        ],
+    )
+    def test_qb_config_normalizes_megatron_method_names(self, stored, expected):
+        config = Apertus2Config(use_quantile_balancing=True).to_dict()
+        config["moe_router_quantile_balancing_method"] = stored
+        restored = Apertus2Config.from_dict(config)
+        assert restored.moe_router_quantile_balancing_method == expected
 
     def test_pretrained_model_flags(self):
         assert "e_score_correction_bias" in Apertus2ForCausalLM._keep_in_fp32_modules_strict
@@ -872,11 +898,11 @@ class TestGroupLimitedRouting:
 
 
 # ---------------------------------------------------------------------------
-# Quantile-balancing router:
-# selection = topk(RAW pre-sigmoid logits MINUS qb_beta) — the two traps vs the
-# GLM correction-bias pattern are SUBTRACT (not add) and RAW logits (not
-# post-sigmoid scores). Gate values stay bias-free renormed-then-scaled sigmoid
-# scores; e_score_correction_bias is ignored for selection when QB is on.
+# Quantile-balancing router: the default "sigmoid" method selects from sigmoid scores
+# minus qb_beta; "legacy" selects from RAW logits minus qb_beta (Megatron spellings
+# average/histogram/legacy_average normalize onto the pair). Gate values stay bias-free
+# renormed-then-scaled sigmoid scores in every method, and e_score_correction_bias is
+# ignored for selection when QB is on.
 # ---------------------------------------------------------------------------
 
 
@@ -885,8 +911,20 @@ class TestQuantileBalancing:
         """Order-insensitive top-k index comparison (topk uses sorted=False)."""
         return torch.sort(idx, dim=-1)[0]
 
-    def _qb_moe_and_logits(self, make_model, n_tokens=6, sandwich=False, latent=None):
-        model = make_model(sandwich, latent, use_quantile_balancing=True)
+    def _qb_moe_and_logits(
+        self,
+        make_model,
+        n_tokens=6,
+        sandwich=False,
+        latent=None,
+        method="legacy",
+    ):
+        model = make_model(
+            sandwich,
+            latent,
+            use_quantile_balancing=True,
+            moe_router_quantile_balancing_method=method,
+        )
         moe = model.model.layers[1].mlp
         generator = torch.Generator().manual_seed(7)
         x = torch.randn(n_tokens, TINY_HIDDEN, generator=generator)
@@ -941,9 +979,9 @@ class TestQuantileBalancing:
         }
         assert {k for k in state_dict if "qb_beta" in k} == expected
 
-    # -- 2. selection math: topk(RAW logits - qb_beta), and it moves top-k ---
+    # -- 2. selection math and method-specific score space -------------------
 
-    def test_selection_is_topk_of_raw_logits_minus_qb_beta(self, make_model):
+    def test_legacy_selection_is_topk_of_raw_logits_minus_qb_beta(self, make_model):
         moe, logits = self._qb_moe_and_logits(make_model)
         with torch.no_grad():
             plain_idx = torch.topk(logits, k=TINY_TOPK, dim=-1).indices
@@ -968,7 +1006,7 @@ class TestQuantileBalancing:
         )
         assert not torch.equal(self._sorted(idx), self._sorted(plain_idx))
 
-    def test_selection_shift_applies_pre_sigmoid(self, make_model):
+    def test_legacy_selection_shift_applies_pre_sigmoid(self, make_model):
         # Saturation case: distinguishes topk(logits - beta) from the plausible-but-wrong
         # topk(sigmoid(logits) - beta). With logits A=10, B=5, C=4 (rest -10) and beta A=2:
         #   raw shifted:     A=8    > B=5     > C=4     -> top-2 = {A, B}
@@ -991,9 +1029,28 @@ class TestQuantileBalancing:
                 idx, _ = moe.gate.route_tokens_to_experts(logits[t : t + 1])
                 ref_idx = torch.topk(logits[t : t + 1] - beta_t, k=TINY_TOPK, dim=-1).indices
             assert torch.equal(self._sorted(idx), self._sorted(ref_idx)), (
-                "QB selection does not match topk(raw_logits - qb_beta) in the sigmoid-"
+                "legacy QB selection does not match topk(raw_logits - qb_beta) in the sigmoid-"
                 "saturated regime — the shift is being applied post-sigmoid"
             )
+
+    @pytest.mark.parametrize("method", ["sigmoid", "histogram"])
+    def test_default_method_selects_from_sigmoid_scores(self, make_model, method):
+        # A=10/B=5/C=4 with beta[A]=2 distinguishes the two score spaces:
+        # raw-beta chooses {A, B}, while sigmoid-beta chooses {B, C}.
+        moe, _ = self._qb_moe_and_logits(make_model, method=method)
+        logits = torch.full((1, TINY_N_EXPERTS), -10.0)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 10.0, 5.0, 4.0
+        beta = torch.zeros(TINY_N_EXPERTS)
+        beta[0] = 2.0
+        with torch.no_grad():
+            moe.gate.qb_beta.copy_(beta)
+            idx, _ = moe.gate.route_tokens_to_experts(logits)
+            ref_idx = torch.topk(
+                logits.sigmoid() - beta, k=TINY_TOPK, dim=-1
+            ).indices
+            legacy_idx = torch.topk(logits - beta, k=TINY_TOPK, dim=-1).indices
+        assert torch.equal(self._sorted(idx), self._sorted(ref_idx))
+        assert not torch.equal(self._sorted(idx), self._sorted(legacy_idx))
 
     # -- 3. gate values are bias-free (qb_beta never touches them) ----------
 
@@ -1120,7 +1177,39 @@ class TestQuantileBalancing:
             Apertus2Config(use_quantile_balancing=True, n_group=2, topk_group=2)
         cfg = Apertus2Config(use_quantile_balancing=True)  # n_group=topk_group=1: fine
         assert cfg.use_quantile_balancing is True
+        assert cfg.moe_router_quantile_balancing_method == "sigmoid"
         assert Apertus2Config().use_quantile_balancing is False
+
+    @pytest.mark.parametrize(
+        "method, expected",
+        [
+            ("sigmoid", "sigmoid"),
+            ("legacy", "legacy"),
+            ("average", "sigmoid"),
+            ("histogram", "sigmoid"),
+            ("legacy_average", "legacy"),
+        ],
+    )
+    def test_qb_methods_are_accepted_and_normalized(self, method, expected):
+        cfg = Apertus2Config(
+            use_quantile_balancing=True,
+            moe_router_quantile_balancing_method=method,
+        )
+        assert cfg.moe_router_quantile_balancing_method == expected
+
+    def test_unknown_qb_method_is_rejected(self):
+        with pytest.raises(ValueError, match="moe_router_quantile_balancing_method"):
+            Apertus2Config(
+                use_quantile_balancing=True,
+                moe_router_quantile_balancing_method="unknown",
+            )
+
+    def test_runtime_rejects_a_method_mutated_after_config_validation(self, make_model):
+        model = make_model(False, None, use_quantile_balancing=True)
+        gate = model.model.layers[1].mlp.gate
+        gate.quantile_balancing_method = "unknown"
+        with pytest.raises(ValueError, match="unsupported.*quantile_balancing_method"):
+            gate.route_tokens_to_experts(torch.randn(1, TINY_N_EXPERTS))
 
 
 # ---------------------------------------------------------------------------

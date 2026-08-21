@@ -326,6 +326,7 @@ class Apertus2TopkRouter(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
         self.use_quantile_balancing = config.use_quantile_balancing
+        self.quantile_balancing_method = config.moe_router_quantile_balancing_method
 
         # The router sees full hidden states even when routed experts use a latent dimension.
         self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size)))
@@ -369,14 +370,25 @@ class Apertus2TopkRouter(nn.Module):
         Selection offsets decide *which* experts run, but never alter their mixture weights:
 
         - standard routing selects from ``sigmoid(logits) + correction_bias``;
-        - quantile balancing selects from raw ``logits - qb_beta``;
+        - quantile balancing selects from ``sigmoid(logits) - qb_beta`` by default, or from
+          raw ``logits - qb_beta`` under the ``legacy`` method;
         - both gather weights from the same bias-free ``sigmoid(logits)`` tensor;
         - gathered weights are normalized first and multiplied by the routing scale last.
         """
         gate_scores = router_logits.sigmoid()
         if self.use_quantile_balancing:
-            # QB and correction bias are mutually exclusive selection paths.
-            selection_scores = router_logits - self.qb_beta
+            # QB and correction bias are mutually exclusive selection paths.  The config
+            # normalizes Megatron's estimator names, so only the canonical pair reaches here.
+            if self.quantile_balancing_method == "legacy":
+                qb_scores = router_logits
+            elif self.quantile_balancing_method == "sigmoid":
+                qb_scores = gate_scores
+            else:
+                raise ValueError(
+                    "unsupported moe_router_quantile_balancing_method at runtime: "
+                    f"{self.quantile_balancing_method!r}"
+                )
+            selection_scores = qb_scores - self.qb_beta
             selected_experts = torch.topk(selection_scores, k=self.top_k, dim=-1, sorted=False).indices
         else:
             selection_scores = gate_scores + self.e_score_correction_bias

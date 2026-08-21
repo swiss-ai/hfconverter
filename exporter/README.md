@@ -97,6 +97,24 @@ Options that affect verification:
 resident during streaming. `--verify-load` is different: it requires enough
 CPU memory for the entire completed model plus overhead.
 
+For quantile-balanced checkpoints, the exporter persists the selection score
+space as `moe_router_quantile_balancing_method`: `sigmoid` (the default)
+selects experts from `sigmoid(logits) - qb_beta`, `legacy` from raw
+`logits - qb_beta`. Megatron's estimator names are accepted and normalized
+(`average`/`histogram` -> `sigmoid`, `legacy_average` -> `legacy`). Current
+Megatron does not save the method in the checkpoint arguments; the exporter
+then defaults to `sigmoid`, which matches every current estimator. Early
+raw-logit runs must be exported with
+`--moe-router-quantile-balancing-method=legacy` — the exporter cannot detect
+them from metadata alone.
+
+The cluster wrappers forward exporter-only options through `EXTRA_EXPORT_ARGS`:
+
+```bash
+EXTRA_EXPORT_ARGS='--moe-router-quantile-balancing-method legacy' \
+  cluster/convert.sh /path/to/torch_dist/iter_XXXXXXX /path/to/hf-output
+```
+
 The same entry point is available from Python:
 
 ```python
@@ -112,6 +130,9 @@ summary = export_checkpoint(
 )
 ```
 
+For an early raw-logit QB checkpoint, add
+`moe_router_quantile_balancing_method="legacy"` to the Python call.
+
 ## Supported checkpoint features
 
 The current config and mapping support the Apertus 2 variants exercised by
@@ -120,7 +141,7 @@ the test suite and production export, including:
 - SwiGLU and SSSGLU;
 - explicit per-layer dense/MoE schedules;
 - standard and latent routed experts, a shared expert, expert bias, and
-  quantile-balancing state;
+  method-aware quantile-balancing state;
 - regular and offloaded expert checkpoint layouts;
 - plain and sandwich-norm residual layouts;
 - full/sliding attention schedules and per-layer RoPE/NoPE schedules;

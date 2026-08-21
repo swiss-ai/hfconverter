@@ -29,7 +29,16 @@ COMBO_PARAMS = [
 ]
 
 
-def _build_and_save(tmp_path, sandwich, latent, qb, expert_bias, seed=0, **model_overrides):
+def _build_and_save(
+    tmp_path,
+    sandwich,
+    latent,
+    qb,
+    expert_bias,
+    seed=0,
+    omit_qb_method=False,
+    **model_overrides,
+):
     model = megatron_mock.build_tiny_model(
         sandwich,
         latent,
@@ -42,6 +51,8 @@ def _build_and_save(tmp_path, sandwich, latent, qb, expert_bias, seed=0, **model
         model, model.config, expert_bias_present=expert_bias
     )
     args = megatron_mock.make_args_namespace(model.config, expert_bias_present=expert_bias)
+    if omit_qb_method:
+        delattr(args, "moe_router_quantile_balancing_method")
     checkpoint_dir = tmp_path / "iter_0000100"
     megatron_mock.save_synthetic_checkpoint(tensors, args, checkpoint_dir, iteration=100)
     return model, checkpoint_dir
@@ -108,6 +119,9 @@ class TestRoundtrip:
         assert "keel_alpha" not in saved
         assert saved["moe_latent_size"] == latent
         assert saved["use_quantile_balancing"] is qb
+        assert saved["moe_router_quantile_balancing_method"] == (
+            model.config.moe_router_quantile_balancing_method
+        )
         assert saved["embedding_multiplier"] == megatron_mock.TINY_EMBEDDING_MULTIPLIER
         assert saved["residual_multiplier"] == megatron_mock.TINY_RESIDUAL_MULTIPLIER
         assert saved["vocab_size"] == 128
@@ -148,6 +162,59 @@ class TestRoundtrip:
                 assert "expert_bias" in f.read(), (
                     "synthesized expert_bias keys should be recorded in conversion_info.json"
                 )
+
+    def test_missing_source_qb_method_defaults_to_sigmoid_and_records_override(
+        self, dist_env, export_api, tmp_path
+    ):
+        model, checkpoint_dir = _build_and_save(
+            tmp_path,
+            sandwich=False,
+            latent=None,
+            qb=True,
+            expert_bias=False,
+            omit_qb_method=True,
+        )
+
+        # Current Megatron never persists the method: the export must succeed and land on the
+        # sigmoid score space without any flag.
+        default_dir = tmp_path / "hf_default"
+        export_api(checkpoint_dir, default_dir)
+        with open(default_dir / "config.json") as handle:
+            saved = json.load(handle)
+        assert saved["moe_router_quantile_balancing_method"] == "sigmoid"
+        reloaded = Apertus2ForCausalLM.from_pretrained(
+            str(default_dir), dtype=torch.float32
+        ).eval()
+        assert reloaded.config.moe_router_quantile_balancing_method == "sigmoid"
+        input_ids = torch.tensor([[5, 7, 11, 13]], dtype=torch.long)
+        with torch.no_grad():
+            source_logits = model(input_ids).logits
+            restored_logits = reloaded(input_ids).logits
+        torch.testing.assert_close(source_logits, restored_logits, rtol=1e-6, atol=1e-6)
+        with open(default_dir / "conversion_info.json") as handle:
+            conversion_info = json.load(handle)
+        assert (
+            conversion_info["settings"]["moe_router_quantile_balancing_method_override"]
+            is None
+        )
+
+        # Early raw-logit checkpoints are exported by explicitly opting into legacy selection.
+        legacy_dir = tmp_path / "hf_legacy"
+        export_api(
+            checkpoint_dir,
+            legacy_dir,
+            "--moe-router-quantile-balancing-method",
+            "legacy",
+        )
+        with open(legacy_dir / "config.json") as handle:
+            saved = json.load(handle)
+        assert saved["moe_router_quantile_balancing_method"] == "legacy"
+        with open(legacy_dir / "conversion_info.json") as handle:
+            conversion_info = json.load(handle)
+        assert (
+            conversion_info["settings"]["moe_router_quantile_balancing_method_override"]
+            == "legacy"
+        )
 
     def test_interleaved_dense_moe_schedule_round_trips_bitwise(
         self, dist_env, export_api, tmp_path
