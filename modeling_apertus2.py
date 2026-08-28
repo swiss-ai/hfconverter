@@ -548,6 +548,13 @@ class Apertus2DecoderLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: Apertus2Config, layer_idx: int):
         super().__init__()
+        # Fail closed until the KDA module lands: building Apertus2Attention for a
+        # 'linear_attention' layer would silently produce a softmax model around KDA weights.
+        if config.layer_types[layer_idx] == "linear_attention":
+            raise NotImplementedError(
+                f"layer_types marks layer {layer_idx} as 'linear_attention' (KDA), which "
+                "modeling_apertus2 does not implement yet"
+            )
         self.hidden_size = config.hidden_size
         self.sandwich_norm = config.sandwich_norm
         self.residual_multiplier = config.residual_multiplier

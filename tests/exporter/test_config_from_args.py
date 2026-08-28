@@ -10,7 +10,9 @@ geometry floats sqrt(32) and 1/sqrt(6); kv_channels None fallback; moe_ffn fallb
 n_shared derivation; explicit/interleaved moe_layer_freq and homogeneous-int rejection; QB
 detection from list AND scalar
 string; expert_bias_present passthrough; every hard assert firing with a ValueError that
-names the offending arg (one bad arg at a time on an otherwise-good namespace).
+names the offending arg (one bad arg at a time on an otherwise-good namespace); KDA
+(experimental_attention_variant) pattern/geometry/gate derivation, math-silent KDA knob
+rejection, and Apertus2Config's own KDA schedule/geometry consistency checks.
 """
 
 import math
@@ -698,3 +700,199 @@ class TestOffloadedExpertStorage:
                                         moe_use_inplace_fp8_param=True,
                                         moe_use_extra_fp8_param_storage=True))
         assert result.offloaded_experts is True
+
+
+# ---------------------------------------------------------------------------
+# KDA (experimental_attention_variant == 'kda')
+# ---------------------------------------------------------------------------
+
+# Coherent KDA overrides at the tiny geometry: 2 KDA layers + 1 softmax, symmetric heads,
+# safe (bounded) decay gate as in every real KDA run.
+KDA_OVERRIDES = dict(
+    experimental_attention_variant="kda",
+    linear_attention_freq=[1, 1, 0],
+    linear_num_key_heads=2,
+    linear_num_value_heads=2,
+    linear_key_head_dim=8,
+    linear_value_head_dim=8,
+    linear_conv_kernel_dim=4,
+    linear_attention_safe_output_gate=True,
+    linear_attention_safe_output_gate_lower_bound=-5.0,
+)
+
+
+def kda_args(**overrides):
+    merged = dict(KDA_OVERRIDES)
+    merged.update(overrides)
+    return good_args(**merged)
+
+
+class TestLinearAttentionDerivation:
+    """KDA replaces softmax attention per layer; every other variant is rejected by name."""
+
+    def test_kda_pattern_lands_in_layer_types(self):
+        kwargs, _, _ = derive(kda_args())
+        assert kwargs["layer_types"] == [
+            "linear_attention", "linear_attention", "full_attention"
+        ]
+
+    def test_kda_geometry_and_gate_land_in_config(self):
+        config = derive_config(kda_args())
+        assert config.linear_num_key_heads == 2
+        assert config.linear_num_value_heads == 2
+        assert config.linear_key_head_dim == 8
+        assert config.linear_value_head_dim == 8
+        assert config.linear_conv_kernel_dim == 4
+        assert config.gate_lower_bound == -5.0
+
+    def test_unsafe_gate_exports_a_none_lower_bound(self):
+        # gate_lower_bound=None must mean "softplus decay gate", not "default to -5".
+        config = derive_config(kda_args(linear_attention_safe_output_gate=False))
+        assert config.gate_lower_bound is None
+
+    def test_int_freq_makes_every_nth_layer_softmax(self):
+        # The fork expands int N to softmax where 1-indexed layer % N == 0, KDA elsewhere.
+        kwargs, _, _ = derive(kda_args(linear_attention_freq=3))
+        assert kwargs["layer_types"] == [
+            "linear_attention", "linear_attention", "full_attention"
+        ]
+
+    def test_variant_none_keeps_every_layer_softmax(self):
+        config = derive_config(good_args())
+        assert config.layer_types == ["full_attention"] * 3
+        assert config.linear_num_key_heads is None
+        assert config.gate_lower_bound is None
+
+    def test_checkpoints_predating_the_variant_field_are_accepted(self):
+        args = good_args()
+        delattr(args, "experimental_attention_variant")
+        config = derive_config(args)
+        assert config.layer_types == ["full_attention"] * 3
+
+    def test_stale_kda_knobs_are_inert_without_the_variant(self):
+        # Mirrors test_skip_freq_is_ignored_without_a_window: settings that affect no layer
+        # must not conjure KDA layers or reach the config.
+        config = derive_config(good_args(
+            linear_attention_freq=[1, 1, 1],
+            linear_attention_allow_neg_eigval=True,
+            linear_attention_safe_output_gate=True,
+        ))
+        assert config.layer_types == ["full_attention"] * 3
+        assert config.linear_num_key_heads is None
+        assert config.gate_lower_bound is None
+
+    def test_all_softmax_pattern_degenerates_to_a_plain_model(self):
+        config = derive_config(kda_args(linear_attention_freq=[0, 0, 0]))
+        assert config.layer_types == ["full_attention"] * 3
+        assert config.linear_num_key_heads is None
+        assert config.gate_lower_bound is None
+
+    @pytest.mark.parametrize("variant", ["gated_delta_net", "dsa"])
+    def test_other_attention_variants_are_rejected_by_name(self, variant):
+        with pytest.raises(ValueError, match="experimental_attention_variant"):
+            derive(good_args(experimental_attention_variant=variant))
+
+    def test_kda_with_sliding_window_is_rejected(self):
+        with pytest.raises(ValueError, match="window_size"):
+            derive(kda_args(window_size=(8, 0), window_attn_skip_freq=[1, 1, 0]))
+
+    @pytest.mark.parametrize(
+        "freq",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param([1, 0], id="wrong-length"),
+            pytest.param([1, 2, 0], id="non-binary-entry"),
+        ],
+    )
+    def test_bad_freq_is_rejected(self, freq):
+        with pytest.raises(ValueError, match="linear_attention_freq"):
+            derive(kda_args(linear_attention_freq=freq))
+
+    @pytest.mark.parametrize("name", [
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+    ])
+    def test_missing_geometry_is_rejected_by_name(self, name):
+        with pytest.raises(ValueError, match=name):
+            derive(kda_args(**{name: None}))
+
+    def test_asymmetric_heads_are_rejected(self):
+        with pytest.raises(ValueError, match="linear_num_key_heads"):
+            derive(kda_args(linear_num_value_heads=4))
+
+    @pytest.mark.parametrize("bound", [-6.0, 0.0, 1.0])
+    def test_out_of_envelope_gate_bound_is_rejected(self, bound):
+        # FlashKDA's non-rescaling kernel and vLLM both assert g_min in [-5, 0).
+        with pytest.raises(ValueError, match="lower_bound"):
+            derive(kda_args(linear_attention_safe_output_gate_lower_bound=bound))
+
+    # Math-silent knobs: each changes KDA layer math or parameter layout, most without
+    # changing any tensor or key, so only this boundary stands between them and a wrong export.
+    @pytest.mark.parametrize(
+        "attribute,bad_value",
+        [
+            ("linear_attention_allow_neg_eigval", True),
+            ("linear_attention_use_decay", False),
+            ("linear_attention_qk_norm", "rmsnorm"),
+            ("linear_attention_v_norm", "l2norm"),
+            ("linear_attention_n_householder", 2),
+            ("linear_attention_n_erase", 1),
+            ("linear_attention_use_output_gate", False),
+            ("linear_attention_output_gate_form", "scalar"),
+            ("linear_attention_full_rank_output_gate", True),
+            ("linear_attention_beta_scale", 0.95),
+            ("linear_attention_beta_bias_init", -2.0),
+            ("linear_attention_learnable_initial_state", True),
+            ("linear_attention_carry_state", True),
+        ],
+    )
+    def test_math_silent_kda_knobs_are_rejected_by_name(self, attribute, bad_value):
+        with pytest.raises(ValueError, match=attribute):
+            derive(kda_args(**{attribute: bad_value}))
+
+    def test_kda_checkpoints_missing_newer_knob_fields_use_fork_defaults(self):
+        args = kda_args()
+        delattr(args, "linear_attention_beta_scale")
+        delattr(args, "linear_attention_carry_state")
+        derive_config(args)
+
+
+class TestKdaConfigValidation:
+    """Apertus2Config must reject half-described KDA models regardless of who built them."""
+
+    def test_linear_layers_without_geometry_are_rejected(self):
+        with pytest.raises(ValueError, match="linear_num_key_heads"):
+            megatron_mock.tiny_export_config(
+                layer_types=["linear_attention", "full_attention", "full_attention"]
+            )
+
+    def test_stray_geometry_without_linear_layers_is_rejected(self):
+        with pytest.raises(ValueError, match="linear_attention"):
+            megatron_mock.tiny_export_config(linear_num_key_heads=2)
+
+    def test_mixed_sliding_and_linear_layers_are_rejected(self):
+        with pytest.raises(ValueError, match="sliding"):
+            megatron_mock.tiny_export_config(
+                layer_types=["linear_attention", "sliding_attention", "full_attention"],
+                sliding_window=9,
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_conv_kernel_dim=4,
+            )
+
+    def test_out_of_range_gate_bound_is_rejected(self):
+        with pytest.raises(ValueError, match="gate_lower_bound"):
+            megatron_mock.tiny_export_config(
+                layer_types=["linear_attention", "full_attention", "full_attention"],
+                linear_num_key_heads=2,
+                linear_num_value_heads=2,
+                linear_key_head_dim=8,
+                linear_value_head_dim=8,
+                linear_conv_kernel_dim=4,
+                gate_lower_bound=-6.0,
+            )

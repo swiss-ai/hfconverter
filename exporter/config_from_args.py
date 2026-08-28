@@ -398,6 +398,189 @@ def _derive_attention_window(
     return sliding_window, layer_types
 
 
+# KDA ablation knobs that change layer math or parameter layout, checked only when the
+# checkpoint actually contains KDA layers (inert on softmax-only checkpoints, where a stale
+# value affects no layer).  Each entry: (attribute, fork dataclass default for checkpoints
+# predating the field, required value, why the bijection alone cannot catch a deviation).
+_KDA_KNOB_REQUIREMENTS = (
+    ("linear_attention_allow_neg_eigval", False, False,
+     "beta = 2*sigmoid(...) changes delta-rule math without changing any tensor or key"),
+    ("linear_attention_use_decay", True, True,
+     "disabled decay forces g to zero while the A_log/dt_bias keys remain in the checkpoint"),
+    ("linear_attention_qk_norm", "l2norm", "l2norm",
+     "the HF module applies the parameter-free FLA l2norm to Q and K"),
+    ("linear_attention_v_norm", "none", "none",
+     "an l2norm on V changes write magnitudes without changing any tensor or key"),
+    ("linear_attention_n_householder", 1, 1,
+     "DeltaProduct chains n rank-1 updates per token and widens in_proj"),
+    ("linear_attention_n_erase", 0, 0,
+     "erase-only Householder slots change the recurrence"),
+    ("linear_attention_use_output_gate", True, True,
+     "an ungated model keeps the gate keys but stops multiplying by sigmoid(gate)"),
+    ("linear_attention_output_gate_form", "per_channel", "per_channel",
+     "the scalar form mean-pools the gate projection without changing any tensor or key"),
+    ("linear_attention_full_rank_output_gate", False, False,
+     "the Kimi-K3 full-rank gate changes the in_proj layout; the HF module implements the "
+     "reference low-rank bottleneck"),
+    ("linear_attention_beta_scale", 1.0, 1.0,
+     "a post-sigmoid multiplier on beta leaves every tensor and key unchanged"),
+    ("linear_attention_beta_bias_init", 0.0, 0.0,
+     "a beta logit bias adds a learnable parameter the mapping does not carry"),
+    ("linear_attention_learnable_initial_state", False, False,
+     "a learned S0 adds a parameter and changes where the recurrence starts"),
+    ("linear_attention_carry_state", False, False,
+     "state carried across forward passes has no Hugging Face representation"),
+)
+
+_KDA_GEOMETRY_ARGS = (
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_conv_kernel_dim",
+)
+
+
+def _derive_linear_attention(
+    args: Namespace,
+    support: _SupportBoundary,
+    num_layers: int,
+    layer_types: list[str],
+) -> dict[str, Any]:
+    """Translate the fork's KDA settings, rewriting ``layer_types`` in place.
+
+    ``experimental_attention_variant`` swaps in a completely different attention math whose
+    only checkpoint evidence is a new key namespace on the affected layers. Without this
+    boundary a gated_delta_net or dsa checkpoint would pass config derivation and die later
+    as an anonymous unmapped-key error instead of a named decision; a kda checkpoint would
+    export as a pure-softmax model.
+    """
+    variant = getattr(args, "experimental_attention_variant", None)
+    if variant is None:
+        support.passed.append(
+            "args.experimental_attention_variant is unset: every layer is softmax attention"
+        )
+        return {}
+    support.require(
+        variant == "kda",
+        "args.experimental_attention_variant in (None, 'kda') (gated_delta_net and dsa have "
+        "no Hugging Face counterpart here)",
+        variant,
+    )
+
+    window_size = getattr(args, "window_size", None)
+    support.require(
+        not window_size,
+        "args.window_size is unset when args.experimental_attention_variant == 'kda' (KDA and "
+        "sliding-window attention cannot coexist in one model)",
+        window_size,
+    )
+
+    # Per-layer pattern: 1 = KDA, 0 = softmax. The int form matches the fork's expansion in
+    # experimental_attention_variant_module_specs.py (softmax where 1-indexed layer % N == 0).
+    freq = getattr(args, "linear_attention_freq", None)
+    if freq is None or isinstance(freq, bool):
+        raise ValueError(
+            f"args.linear_attention_freq={freq!r}: must be set when "
+            "args.experimental_attention_variant == 'kda' (the fork asserts the same before "
+            "building the model)"
+        )
+    if isinstance(freq, int):
+        support.require(
+            freq >= 1,
+            "args.linear_attention_freq is a positive integer when given as an int",
+            freq,
+        )
+        pattern = [0 if (index + 1) % freq == 0 else 1 for index in range(num_layers)]
+    else:
+        try:
+            pattern = list(freq)
+        except TypeError as exc:
+            raise ValueError(
+                f"args.linear_attention_freq={freq!r}: expected an integer or a 0/1 list"
+            ) from exc
+        support.require(
+            len(pattern) == num_layers,
+            "len(args.linear_attention_freq) == args.num_layers",
+            (len(pattern), num_layers),
+        )
+        support.require(
+            all(entry in (0, 1) for entry in pattern),
+            "args.linear_attention_freq entries are 0 (softmax) or 1 (KDA)",
+            pattern,
+        )
+
+    linear_layer_indices = [index for index, is_kda in enumerate(pattern) if is_kda]
+    if not linear_layer_indices:
+        support.passed.append(
+            "args.linear_attention_freq marks no layer as KDA: the checkpoint degenerates to "
+            "a pure-softmax model and the KDA knobs are inert"
+        )
+        return {}
+
+    for attribute, fork_default, required, reason in _KDA_KNOB_REQUIREMENTS:
+        actual = getattr(args, attribute, fork_default)
+        support.require(
+            actual == required,
+            f"args.{attribute} == {required!r} ({reason})",
+            actual,
+        )
+
+    geometry: dict[str, Any] = {}
+    for name in _KDA_GEOMETRY_ARGS:
+        value = _req(args, name)
+        support.require(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+            f"args.{name} is a positive integer",
+            value,
+        )
+        geometry[name] = value
+    support.require(
+        geometry["linear_num_key_heads"] == geometry["linear_num_value_heads"],
+        "args.linear_num_key_heads == args.linear_num_value_heads (KDA lays out dt_bias/A_log "
+        "and the delta-rule state per value head against key channels)",
+        (geometry["linear_num_key_heads"], geometry["linear_num_value_heads"]),
+    )
+
+    if getattr(args, "linear_attention_safe_output_gate", False):
+        lower_bound = getattr(
+            args, "linear_attention_safe_output_gate_lower_bound", -5.0
+        )
+        support.require(
+            isinstance(lower_bound, (int, float))
+            and not isinstance(lower_bound, bool)
+            and -5.0 <= float(lower_bound) < 0.0,
+            "args.linear_attention_safe_output_gate_lower_bound is in [-5, 0) (the FlashKDA "
+            "inference envelope; vLLM asserts the same range)",
+            lower_bound,
+        )
+        gate_lower_bound: float | None = float(lower_bound)
+        support.passed.append(
+            f"args.linear_attention_safe_output_gate -> gate_lower_bound = {gate_lower_bound} "
+            "(bounded Kimi-K3 decay gate g = g_min * sigmoid(exp(A_log) * (z + dt_bias)))"
+        )
+    else:
+        gate_lower_bound = None
+        support.passed.append(
+            "args.linear_attention_safe_output_gate is falsy: unbounded decay gate "
+            "g = -exp(A_log) * softplus(z + dt_bias) (gate_lower_bound = None)"
+        )
+
+    # window_size is rejected above, so every non-KDA entry is currently "full_attention".
+    for index in linear_layer_indices:
+        layer_types[index] = "linear_attention"
+    support.passed.append(
+        f"args.linear_attention_freq -> {len(linear_layer_indices)} KDA layers at 0-indexed "
+        f"{linear_layer_indices}; full softmax attention elsewhere"
+    )
+    support.passed.append(
+        "KDA low-rank bottleneck width (decay f_a and output gate g_a) = "
+        f"linear_value_head_dim = {geometry['linear_value_head_dim']} (derived by KDA "
+        "construction, not an independent arg)"
+    )
+    return {**geometry, "gate_lower_bound": gate_lower_bound}
+
+
 def _validate_residual_scheme(args: Namespace, support: _SupportBoundary) -> None:
     """Validate residual options represented by the Hugging Face implementation."""
     fp32_residual = getattr(args, "fp32_residual_connection", False)
@@ -673,6 +856,7 @@ def derive_config(
     rope_parameters = _derive_rope_parameters(args, support)
     no_rope_layers = _derive_no_rope_layers(args, support, num_layers)
     sliding_window, layer_types = _derive_attention_window(args, support, num_layers)
+    linear_attention_kwargs = _derive_linear_attention(args, support, num_layers, layer_types)
     _validate_residual_scheme(args, support)
     _validate_router_and_attention(args, support)
     offloaded_experts = _derive_expert_storage(args, support)
@@ -802,6 +986,8 @@ def derive_config(
         "n_group": n_group,
         "topk_group": topk_group,
     }
+    # Present only for KDA checkpoints: the five linear_* geometry fields plus gate_lower_bound.
+    kwargs.update(linear_attention_kwargs)
 
     expert_bias_present = bool(_req(args, "moe_router_enable_expert_bias"))
     support.passed.append(f"args.moe_router_enable_expert_bias = {expert_bias_present}")

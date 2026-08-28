@@ -214,6 +214,13 @@ class TestContractPlumbing:
         assert cfg.residual_multiplier == RESIDUAL_MULTIPLIER
         assert cfg.initializer_range == 0.02
         assert cfg.use_cache is True
+        # KDA fields default to "no linear-attention layers".
+        assert cfg.linear_num_key_heads is None
+        assert cfg.linear_num_value_heads is None
+        assert cfg.linear_key_head_dim is None
+        assert cfg.linear_value_head_dim is None
+        assert cfg.linear_conv_kernel_dim is None
+        assert cfg.gate_lower_bound is None
 
     def test_removed_keel_fields_cannot_enable_a_legacy_residual_mode(self):
         inactive = Apertus2Config(keel=False, keel_alpha=None)
@@ -329,6 +336,21 @@ class TestTensorParallelUnsupported:
 
 
 class TestConfigValidation:
+    def test_kda_layers_fail_closed_at_model_construction(self, make_config):
+        # A valid KDA config must not silently build softmax attention around KDA weights
+        # until modeling_apertus2 actually implements linear_attention layers.
+        config = make_config(
+            layer_types=["linear_attention", "full_attention", "full_attention"],
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            gate_lower_bound=-5.0,
+        )
+        with pytest.raises(NotImplementedError, match="linear_attention"):
+            Apertus2ForCausalLM(config)
+
     def test_explicit_partial_rotary_factor_kwarg_rejected(self):
         with pytest.raises(ValueError, match="partial_rotary_factor"):
             Apertus2Config(partial_rotary_factor=0.5)

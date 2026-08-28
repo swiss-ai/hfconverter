@@ -54,8 +54,15 @@ class Apertus2Config(PreTrainedConfig):
 
     Two independent per-layer schedules describe attention:
 
-    - ``layer_types`` marks each layer ``"full_attention"`` or ``"sliding_attention"``.  Sliding
-      layers see ``sliding_window`` keys, counting the query's own position.
+    - ``layer_types`` marks each layer ``"full_attention"``, ``"sliding_attention"``, or
+      ``"linear_attention"``.  Sliding layers see ``sliding_window`` keys, counting the query's
+      own position.  Linear-attention layers are KDA (Kimi Delta Attention) recurrent layers:
+      their geometry comes from the ``linear_*`` fields, and ``gate_lower_bound`` selects the
+      decay-gate form — a float ``g_min`` in ``[-5, 0)`` for the bounded Kimi-K3 gate
+      ``g = g_min * sigmoid(exp(A_log) * (z + dt_bias))``, or ``None`` for the unbounded
+      ``g = -exp(A_log) * softplus(z + dt_bias)``.  KDA layers ignore RoPE and
+      ``attention_output_gate`` (they carry their own sigmoid gate), and cannot be mixed with
+      sliding-window layers in one model.
     - ``no_rope_layers`` marks each layer ``1`` (rotate) or ``0`` (NoPE).  The polarity follows
       SmolLM3, and is therefore the *inverse* of Megatron's ``--no-rope-freq``.
 
@@ -122,6 +129,17 @@ class Apertus2Config(PreTrainedConfig):
     sliding_window: int | None = None
     layer_types: list[str] | None = None
     no_rope_layers: list[int] | None = None
+    # KDA (Kimi Delta Attention) geometry, active on the layers whose layer_types entry is
+    # "linear_attention".  Field names follow Qwen3-Next; gate_lower_bound is the Kimi-K3 knob
+    # vLLM consumes.  All six stay None on a pure-softmax model.  The low-rank bottleneck width
+    # of the decay and output-gate projections is not a field: it equals linear_value_head_dim
+    # by KDA construction.
+    linear_num_key_heads: int | None = None
+    linear_num_value_heads: int | None = None
+    linear_key_head_dim: int | None = None
+    linear_value_head_dim: int | None = None
+    linear_conv_kernel_dim: int | None = None
+    gate_lower_bound: float | None = None
     moe_intermediate_size: int = 448
     num_experts_per_tok: int = 4
     n_shared_experts: int = 1
@@ -161,6 +179,7 @@ class Apertus2Config(PreTrainedConfig):
         self._validate_router_options()
         self._set_mlp_schedule()
         self._set_attention_schedules()
+        self._validate_linear_attention()
         self._set_full_rotary_defaults(kwargs)
         super().__post_init__(**kwargs)
 
@@ -292,6 +311,60 @@ class Apertus2Config(PreTrainedConfig):
         if any(entry not in (0, 1) for entry in self.no_rope_layers):
             raise ValueError(
                 f"no_rope_layers entries must be 0 (NoPE) or 1 (rotate); got {self.no_rope_layers}"
+            )
+
+    def _validate_linear_attention(self) -> None:
+        """Keep the KDA field set and the layer_types schedule describing the same model.
+
+        Runs after ``_set_attention_schedules``, so ``layer_types`` is always a full list here.
+        A half-described KDA model must never construct: geometry without schedule (or the
+        reverse) would build softmax layers where the checkpoint holds recurrent-state weights.
+        """
+        geometry = {
+            "linear_num_key_heads": self.linear_num_key_heads,
+            "linear_num_value_heads": self.linear_num_value_heads,
+            "linear_key_head_dim": self.linear_key_head_dim,
+            "linear_value_head_dim": self.linear_value_head_dim,
+            "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+        }
+        if "linear_attention" not in self.layer_types:
+            stray = {name: value for name, value in geometry.items() if value is not None}
+            if self.gate_lower_bound is not None:
+                stray["gate_lower_bound"] = self.gate_lower_bound
+            if stray:
+                raise ValueError(
+                    "KDA fields are set but no layer_types entry is 'linear_attention'; the "
+                    "schedule and the geometry describe different models: "
+                    f"{stray!r}"
+                )
+            return
+
+        if "sliding_attention" in self.layer_types:
+            raise ValueError(
+                "layer_types mixes 'linear_attention' (KDA) and 'sliding_attention' layers; "
+                "KDA and sliding-window attention cannot coexist in one Apertus2 model: "
+                f"{self.layer_types}"
+            )
+        for name, value in geometry.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(
+                    f"layer_types contains 'linear_attention' layers, so {name} must be a "
+                    f"positive integer; got {value!r}"
+                )
+        if self.linear_num_key_heads != self.linear_num_value_heads:
+            raise ValueError(
+                "linear_num_key_heads must equal linear_num_value_heads (KDA lays out "
+                "dt_bias/A_log and the delta-rule state per value head against key channels); "
+                f"got {self.linear_num_key_heads} and {self.linear_num_value_heads}"
+            )
+        if self.gate_lower_bound is not None and not (
+            isinstance(self.gate_lower_bound, (int, float))
+            and -5.0 <= float(self.gate_lower_bound) < 0.0
+        ):
+            raise ValueError(
+                "gate_lower_bound must be None (unbounded softplus decay gate) or a float in "
+                "[-5, 0) (the bounded Kimi-K3 gate; FlashKDA and vLLM assert the same range); "
+                f"got {self.gate_lower_bound!r}"
             )
 
     def _set_full_rotary_defaults(self, kwargs: dict) -> None:
