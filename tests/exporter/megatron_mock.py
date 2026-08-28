@@ -399,6 +399,99 @@ def to_megatron_tensors(model, config=None, expert_bias_present=True):
 
 
 # ---------------------------------------------------------------------------
+# KDA (Kimi Delta Attention) tiny fixture: independent key/shape table + builder.
+# ---------------------------------------------------------------------------
+# Symmetric key == value heads and dims, like every real KDA run; the low-rank
+# bottleneck width equals the value head dim by KDA construction.
+TINY_KDA_HEADS = 2
+TINY_KDA_HEAD_DIM = 8
+TINY_KDA_CONV_KERNEL = 4
+TINY_KDA_PATTERN = [1, 1, 0]  # fork spelling: 1 = KDA, 0 = softmax; last layer global
+
+
+def kda_attention_key_triples(layer):
+    """(megatron_key, hf_key, shape) for one KDA layer, independent of exporter.mapping.
+
+    The fork persists the fused in_proj/conv1d PRE-SPLIT (KimiDeltaAttention.
+    _in_proj_sharded_split), so every pair is a pure rename. HF names are the Kimi-Linear
+    checkpoint spellings vLLM's loaders consume; g_b_proj.bias is this fork's addition.
+    """
+    mg = f"decoder.layers.{layer}.self_attention."
+    hf = f"model.layers.{layer}.self_attn."
+    hidden = TINY_HIDDEN
+    qk_dim = TINY_KDA_HEADS * TINY_KDA_HEAD_DIM
+    value_dim = TINY_KDA_HEADS * TINY_KDA_HEAD_DIM
+    low_rank = TINY_KDA_HEAD_DIM
+    decay_dim = TINY_KDA_HEADS * TINY_KDA_HEAD_DIM
+    kernel = TINY_KDA_CONV_KERNEL
+    return [
+        (mg + "in_proj.layer_norm_weight",
+         f"model.layers.{layer}.attention_layernorm.weight", (hidden,)),
+        (mg + "in_proj.weight.query", hf + "q_proj.weight", (qk_dim, hidden)),
+        (mg + "in_proj.weight.key", hf + "k_proj.weight", (qk_dim, hidden)),
+        (mg + "in_proj.weight.value", hf + "v_proj.weight", (value_dim, hidden)),
+        (mg + "in_proj.weight.decay_low_rank", hf + "f_a_proj.weight", (low_rank, hidden)),
+        (mg + "in_proj.weight.gate_low_rank", hf + "g_a_proj.weight", (low_rank, hidden)),
+        (mg + "in_proj.weight.beta", hf + "b_proj.weight", (TINY_KDA_HEADS, hidden)),
+        (mg + "conv1d.weight.query", hf + "q_conv1d.weight", (qk_dim, 1, kernel)),
+        (mg + "conv1d.weight.key", hf + "k_conv1d.weight", (qk_dim, 1, kernel)),
+        (mg + "conv1d.weight.value", hf + "v_conv1d.weight", (value_dim, 1, kernel)),
+        (mg + "A_log", hf + "A_log", (TINY_KDA_HEADS,)),
+        (mg + "dt_bias", hf + "dt_bias", (decay_dim,)),
+        (mg + "decay_out_proj.weight", hf + "f_b_proj.weight", (decay_dim, low_rank)),
+        (mg + "gate_out_proj.weight", hf + "g_b_proj.weight", (value_dim, low_rank)),
+        (mg + "gate_out_proj.bias", hf + "g_b_proj.bias", (value_dim,)),
+        (mg + "out_norm.weight", hf + "o_norm.weight", (TINY_KDA_HEAD_DIM,)),
+        (mg + "out_proj.weight", hf + "o_proj.weight", (hidden, value_dim)),
+    ]
+
+
+def build_tiny_kda_checkpoint(seed=0, expert_bias_present=True):
+    """(megatron tensors, args, expected_hf, donor) for the tiny KDA combo.
+
+    The HF modeling file fails closed on linear_attention layers until the KDA module lands,
+    so the KDA layers are synthesized directly at the checkpoint-key level. The softmax layer
+    and the whole MLP/embedding stack come from a donor tiny softmax model with
+    attention_output_gate on (mirroring the real KDA runs, whose globals are gated).
+    ``expected_hf`` maps each KDA-layer HF key to the tensor a faithful export must produce
+    bit-identically; the donor covers the rest.
+    """
+    donor = build_tiny_model(
+        False, None, False, seed=seed, attention_output_gate=True
+    )
+    tensors = to_megatron_tensors(
+        donor, donor.config, expert_bias_present=expert_bias_present
+    )
+
+    generator = torch.Generator().manual_seed(seed + 4242)
+    expected_hf = {}
+    for layer, is_kda in enumerate(TINY_KDA_PATTERN):
+        if not is_kda:
+            continue
+        prefix = f"decoder.layers.{layer}.self_attention."
+        for key in [k for k in tensors if k.startswith(prefix)]:
+            del tensors[key]
+        for megatron_key, hf_key, tensor_shape in kda_attention_key_triples(layer):
+            tensor = torch.randn(tensor_shape, generator=generator)
+            tensors[megatron_key] = tensor
+            expected_hf[hf_key] = tensor
+
+    args = make_args_namespace(
+        donor.config,
+        expert_bias_present=expert_bias_present,
+        experimental_attention_variant="kda",
+        linear_attention_freq=list(TINY_KDA_PATTERN),
+        linear_num_key_heads=TINY_KDA_HEADS,
+        linear_num_value_heads=TINY_KDA_HEADS,
+        linear_key_head_dim=TINY_KDA_HEAD_DIM,
+        linear_value_head_dim=TINY_KDA_HEAD_DIM,
+        linear_conv_kernel_dim=TINY_KDA_CONV_KERNEL,
+        linear_attention_safe_output_gate=True,
+    )
+    return tensors, args, expected_hf, donor
+
+
+# ---------------------------------------------------------------------------
 # Args Namespace with the fork spellings consumed by config derivation.
 # ---------------------------------------------------------------------------
 

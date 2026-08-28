@@ -133,6 +133,12 @@ class _Geometry:
     use_qk_norm: bool
     use_quantile_balancing: bool
     use_attention_gate: bool
+    layer_types: tuple[str, ...] | None
+    linear_num_key_heads: int | None
+    linear_num_value_heads: int | None
+    linear_key_head_dim: int | None
+    linear_value_head_dim: int | None
+    linear_conv_kernel_dim: int | None
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "_Geometry":
@@ -152,6 +158,14 @@ class _Geometry:
             first_dense_layers = 0
             while first_dense_layers < num_layers and schedule[first_dense_layers] == 0:
                 first_dense_layers += 1
+        layer_types = config.get("layer_types")
+        if layer_types is not None:
+            layer_types = tuple(layer_types)
+            if len(layer_types) != num_layers:
+                raise ValueError(
+                    "mapping config layer_types must contain one entry per layer; "
+                    f"got {len(layer_types)} entries for {num_layers} layers"
+                )
         return cls(
             hidden_size=config["hidden_size"],
             vocabulary_size=config["vocab_size"],
@@ -170,6 +184,12 @@ class _Geometry:
             use_qk_norm=config["use_qk_norm"],
             use_quantile_balancing=config["use_quantile_balancing"],
             use_attention_gate=bool(config.get("attention_output_gate", False)),
+            layer_types=layer_types,
+            linear_num_key_heads=config.get("linear_num_key_heads"),
+            linear_num_value_heads=config.get("linear_num_value_heads"),
+            linear_key_head_dim=config.get("linear_key_head_dim"),
+            linear_value_head_dim=config.get("linear_value_head_dim"),
+            linear_conv_kernel_dim=config.get("linear_conv_kernel_dim"),
         )
 
     @property
@@ -178,6 +198,12 @@ class _Geometry:
 
     def is_moe_layer(self, layer_index: int) -> bool:
         return bool(self.moe_layer_freq[layer_index])
+
+    def is_linear_attention_layer(self, layer_index: int) -> bool:
+        return (
+            self.layer_types is not None
+            and self.layer_types[layer_index] == "linear_attention"
+        )
 
 
 def _model_level_rows(shape: _Geometry) -> list[Row]:
@@ -271,6 +297,80 @@ def _attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
         )
     )
     return rows
+
+
+def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
+    """Map one KDA (Kimi Delta Attention) recurrent layer.
+
+    The fork persists the fused in_proj and conv1d PRE-SPLIT into per-component keys
+    (``KimiDeltaAttention._in_proj_sharded_split``), so every tensor here is a pure copy —
+    no fusion, split, or transpose. Hugging Face names follow the Kimi-Linear checkpoint
+    spellings that vLLM's KDA loaders consume (q/k/v_proj, b_proj for beta, f_a/f_b_proj for
+    the decay bottleneck, g_a/g_b_proj for the output-gate bottleneck, q/k/v_conv1d, A_log,
+    dt_bias, o_norm, o_proj), with one deviation: this fork's output gate carries a bias
+    (g_b_proj.bias), which Kimi-Linear does not. Both low-rank bottlenecks are
+    value_head_dim wide by KDA construction; dt_bias is per (value head x key channel),
+    flattened.
+    """
+    for name in ("linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim",
+                 "linear_value_head_dim", "linear_conv_kernel_dim"):
+        if not isinstance(getattr(shape, name), int):
+            raise ValueError(
+                f"mapping config marks layer {layer_index} as linear_attention but {name} is "
+                f"{getattr(shape, name)!r}; the KDA geometry must be fully specified"
+            )
+    megatron = f"decoder.layers.{layer_index}.self_attention"
+    hf = f"model.layers.{layer_index}.self_attn"
+    hidden = shape.hidden_size
+    num_value_heads = shape.linear_num_value_heads
+    qk_dim = shape.linear_num_key_heads * shape.linear_key_head_dim
+    value_dim = num_value_heads * shape.linear_value_head_dim
+    low_rank = shape.linear_value_head_dim  # f_a/g_a bottleneck width, fixed by construction
+    decay_dim = num_value_heads * shape.linear_key_head_dim  # dt_bias / f_b output width
+    kernel = shape.linear_conv_kernel_dim
+
+    return [
+        # The fused input norm rides on in_proj, like linear_qkv.layer_norm_weight elsewhere.
+        Row(
+            f"{megatron}.in_proj.layer_norm_weight",
+            (f"model.layers.{layer_index}.attention_layernorm.weight",),
+            COPY,
+            (hidden,),
+        ),
+        Row(f"{megatron}.in_proj.weight.query", (f"{hf}.q_proj.weight",), COPY,
+            (qk_dim, hidden)),
+        Row(f"{megatron}.in_proj.weight.key", (f"{hf}.k_proj.weight",), COPY,
+            (qk_dim, hidden)),
+        Row(f"{megatron}.in_proj.weight.value", (f"{hf}.v_proj.weight",), COPY,
+            (value_dim, hidden)),
+        Row(f"{megatron}.in_proj.weight.decay_low_rank", (f"{hf}.f_a_proj.weight",), COPY,
+            (low_rank, hidden)),
+        Row(f"{megatron}.in_proj.weight.gate_low_rank", (f"{hf}.g_a_proj.weight",), COPY,
+            (low_rank, hidden)),
+        Row(f"{megatron}.in_proj.weight.beta", (f"{hf}.b_proj.weight",), COPY,
+            (num_value_heads, hidden)),
+        # Depthwise conv weights keep nn.Conv1d's (channels, 1, kernel) shape.
+        Row(f"{megatron}.conv1d.weight.query", (f"{hf}.q_conv1d.weight",), COPY,
+            (qk_dim, 1, kernel)),
+        Row(f"{megatron}.conv1d.weight.key", (f"{hf}.k_conv1d.weight",), COPY,
+            (qk_dim, 1, kernel)),
+        Row(f"{megatron}.conv1d.weight.value", (f"{hf}.v_conv1d.weight",), COPY,
+            (value_dim, 1, kernel)),
+        # Decay parameters: one scalar per value head; bias per (value head x key channel).
+        Row(f"{megatron}.A_log", (f"{hf}.A_log",), COPY, (num_value_heads,)),
+        Row(f"{megatron}.dt_bias", (f"{hf}.dt_bias",), COPY, (decay_dim,)),
+        Row(f"{megatron}.decay_out_proj.weight", (f"{hf}.f_b_proj.weight",), COPY,
+            (decay_dim, low_rank)),
+        Row(f"{megatron}.gate_out_proj.weight", (f"{hf}.g_b_proj.weight",), COPY,
+            (value_dim, low_rank)),
+        Row(f"{megatron}.gate_out_proj.bias", (f"{hf}.g_b_proj.bias",), COPY,
+            (value_dim,)),
+        # Per-value-head sigmoid-gated RMSNorm scale.
+        Row(f"{megatron}.out_norm.weight", (f"{hf}.o_norm.weight",), COPY,
+            (shape.linear_value_head_dim,)),
+        Row(f"{megatron}.out_proj.weight", (f"{hf}.o_proj.weight",), COPY,
+            (hidden, value_dim)),
+    ]
 
 
 def _post_norm_rows(layer_index: int, shape: _Geometry) -> list[Row]:
@@ -483,7 +583,10 @@ def build_plan(
     rows = _model_level_rows(shape)
     synthesized: list[SynthesizedTensor] = []
     for layer_index in range(shape.num_layers):
-        rows.extend(_attention_rows(layer_index, shape))
+        if shape.is_linear_attention_layer(layer_index):
+            rows.extend(_kda_attention_rows(layer_index, shape))
+        else:
+            rows.extend(_attention_rows(layer_index, shape))
         rows.extend(_post_norm_rows(layer_index, shape))
         if shape.is_moe_layer(layer_index):
             moe_rows, moe_synthesized = _moe_mlp_rows(
