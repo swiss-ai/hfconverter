@@ -16,7 +16,9 @@
 The complete tensor journey is:
 
 1. Token ids become embeddings with shape ``[batch, sequence, hidden]``.
-2. Every decoder layer runs self-attention, then a dense MLP or a mixture of experts (MoE).
+2. Every decoder layer runs attention — softmax self-attention or a KDA (Kimi Delta
+   Attention) recurrent layer, chosen per layer by ``layer_types`` — then a dense MLP or a
+   mixture of experts (MoE).
 3. Each block returns the same ``[batch, sequence, hidden]`` shape and updates the residual
    stream. Plain and sandwich-norm layers differ only in how that update is combined.
 4. A final RMSNorm produces hidden states; ``Apertus2ForCausalLM`` projects them to one score
@@ -64,6 +66,18 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.generic import merge_with_config_defaults
 from transformers.utils.output_capturing import capture_outputs
+
+# KDA (Kimi Delta Attention) layers run on flash-linear-attention's fused kernels; there is no
+# eager fallback. The dependency stays optional so softmax-only checkpoints keep loading without
+# the package; a KDA layer instead fails loudly at construction (see Apertus2KimiDeltaAttention).
+try:
+    from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+    from fla.modules import FusedRMSNormGated, ShortConvolution
+    from fla.ops.kda import chunk_kda, fused_recurrent_kda
+except ImportError:
+    chunk_kda = fused_recurrent_kda = None
+    FusedRMSNormGated = ShortConvolution = None
+    get_unpad_data = index_first_axis = pad_input = None
 
 try:
     from .configuration_apertus2 import Apertus2Config
@@ -278,6 +292,201 @@ class Apertus2Attention(nn.Module):
             attention_output = (attention_output * torch.sigmoid(gate.float())).to(attention_output.dtype)
         attention_output = self.o_proj(attention_output)
         return attention_output, attention_weights
+
+
+def _cached_state(states):
+    """Read one layer's cached state across Transformers versions.
+
+    ``LinearAttentionLayer`` stores one tensor per layer up to Transformers 5.8 and a
+    ``{state_idx: tensor}`` dict from 5.15; this model always uses one state per layer.
+    """
+    return states[0] if isinstance(states, dict) else states
+
+
+# Linear attention (KDA).
+class Apertus2KimiDeltaAttention(nn.Module):
+    """KDA (Kimi Delta Attention): a gated delta-rule recurrence replacing softmax attention.
+
+    Per token, three convolved projections produce query/key/value heads, and a per-channel
+    decay gate controls how fast the ``[heads, key_dim, value_dim]`` recurrent state forgets:
+    a low-rank bottleneck (``f_a_proj``/``f_b_proj``, width ``linear_value_head_dim`` by KDA
+    construction) emits one raw decay channel per (value head x key channel), which
+    ``chunk_kda`` turns into the actual decay together with ``A_log`` and ``dt_bias`` —
+    the bounded Kimi-K3 form ``g_min * sigmoid(exp(A_log) * (z + dt_bias))`` when
+    ``config.gate_lower_bound`` is set, the unbounded ``-exp(A_log) * softplus(z + dt_bias)``
+    when it is ``None``. ``b_proj`` supplies the delta-rule write strength (sigmoid applied
+    in-kernel), and the read is normalized per value head and gated through a sigmoid
+    (``o_norm``) before ``o_proj``. Positions reach the layer only through the recurrence,
+    so RoPE tables are ignored.
+
+    This is the Kimi-Linear reference module with three checkpoint-contract deviations:
+    the geometry comes from the flat ``linear_*`` config fields (not a nested
+    ``linear_attn_config``), ``config.linear_attn_output_gate_bias`` selects whether
+    ``g_b_proj`` carries a trained bias inside the output-gate sigmoid pre-activation (this
+    fork always trains one, Kimi-Linear never does — dropping a trained bias would shift
+    every gate), and ``o_norm`` honors ``config.rms_norm_eps`` instead of a hardcoded
+    default.
+
+    The attention mask must be the 0/1 ``[batch, seq_len]`` padding mask (or ``None``); the
+    layer unpads to one packed sequence with document boundaries so padded positions never
+    enter the recurrent state. ``Apertus2Model`` prepares exactly that mask per layer type.
+    """
+
+    def __init__(self, config: Apertus2Config, layer_idx: int):
+        if chunk_kda is None:
+            raise ImportError(
+                f"layer_types marks layer {layer_idx} as 'linear_attention' (KDA), which runs "
+                "on flash-linear-attention's fused kernels (fla.ops.kda); install the "
+                "flash-linear-attention package to build this model"
+            )
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.linear_num_value_heads
+        self.head_k_dim = config.linear_key_head_dim
+        self.head_v_dim = config.linear_value_head_dim
+        self.conv_size = config.linear_conv_kernel_dim
+        self.key_dim = config.linear_num_key_heads * self.head_k_dim
+        self.value_dim = self.num_heads * self.head_v_dim
+        # Decay lives per (value head x key channel): f_b_proj and dt_bias share this width.
+        self.decay_dim = self.num_heads * self.head_k_dim
+        self.gate_lower_bound = config.gate_lower_bound
+
+        self.q_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.value_dim, bias=False)
+
+        # Depthwise causal convolutions with the fork's forced silu; the checkpoint stores
+        # nn.Conv1d's (channels, 1, kernel) weight shape. This is deliberately NOT
+        # config.hidden_act, which names the MLP activation (e.g. sssglu).
+        self.q_conv1d = ShortConvolution(self.key_dim, self.conv_size, activation="silu")
+        self.k_conv1d = ShortConvolution(self.key_dim, self.conv_size, activation="silu")
+        self.v_conv1d = ShortConvolution(self.value_dim, self.conv_size, activation="silu")
+
+        self.f_a_proj = nn.Linear(self.hidden_size, self.head_v_dim, bias=False)
+        self.f_b_proj = nn.Linear(self.head_v_dim, self.decay_dim, bias=False)
+        # fp32 like the fork's master copies; _keep_in_fp32_modules_strict preserves that
+        # through low-precision checkpoint loading.
+        self.A_log = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.empty(self.decay_dim, dtype=torch.float32))
+
+        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+
+        # The config declares whether the output-gate up-projection carries a trained bias
+        # inside the sigmoid pre-activation: this fork's checkpoints always do, upstream
+        # Kimi-Linear's never do. State-dict keys then describe the architecture exactly.
+        self.g_a_proj = nn.Linear(self.hidden_size, self.head_v_dim, bias=False)
+        self.g_b_proj = nn.Linear(
+            self.head_v_dim, self.value_dim, bias=config.linear_attn_output_gate_bias
+        )
+
+        self.o_norm = FusedRMSNormGated(
+            self.head_v_dim, eps=config.rms_norm_eps, activation="sigmoid"
+        )
+        self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, None]:
+        if attention_mask is not None and attention_mask.dim() != 2:
+            raise ValueError(
+                "KDA layers take a 0/1 padding mask of shape [batch, seq_len] (0 = padding); "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+        use_cache = past_key_values is not None
+        batch_size, q_len, _ = hidden_states.shape
+
+        # Unpad to one packed sequence: the conv and delta-rule kernels then see per-document
+        # cu_seqlens boundaries, so padded positions never touch any recurrent state.
+        cu_seqlens = kwargs.get("cu_seqlens")
+        indices = None
+        if attention_mask is not None:
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = index_first_axis(hidden_states.flatten(0, 1), indices).unsqueeze(0)
+
+        # A single cache slot holds the q/k/v conv states concatenated on the channel axis
+        # (one tensor per layer works on every Transformers version) plus the recurrent state.
+        conv_state_q = conv_state_k = conv_state_v = None
+        recurrent_state = None
+        if use_cache and past_key_values.has_previous_state(self.layer_idx):
+            layer_cache = past_key_values.layers[self.layer_idx]
+            conv_state_q, conv_state_k, conv_state_v = torch.split(
+                _cached_state(layer_cache.conv_states),
+                [self.key_dim, self.key_dim, self.value_dim],
+                dim=1,
+            )
+            recurrent_state = _cached_state(layer_cache.recurrent_states)
+
+        query, conv_state_q = self.q_conv1d(
+            x=self.q_proj(hidden_states),
+            cache=conv_state_q,
+            output_final_state=use_cache,
+            cu_seqlens=cu_seqlens,
+        )
+        key, conv_state_k = self.k_conv1d(
+            x=self.k_proj(hidden_states),
+            cache=conv_state_k,
+            output_final_state=use_cache,
+            cu_seqlens=cu_seqlens,
+        )
+        value, conv_state_v = self.v_conv1d(
+            x=self.v_proj(hidden_states),
+            cache=conv_state_v,
+            output_final_state=use_cache,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # Raw pre-activations only: the kernel derives the decay from (g, A_log, dt_bias) and
+        # applies beta's sigmoid itself, exactly like the fork's training-time call.
+        decay = self.f_b_proj(self.f_a_proj(hidden_states))
+        decay = decay.view(*decay.shape[:-1], -1, self.head_k_dim)
+        beta = self.b_proj(hidden_states).float()
+
+        query = query.view(*query.shape[:-1], -1, self.head_k_dim)
+        key = key.view(*key.shape[:-1], -1, self.head_k_dim)
+        value = value.view(*value.shape[:-1], -1, self.head_v_dim)
+
+        kda_kwargs = {
+            "g": decay,
+            "beta": beta,
+            "A_log": self.A_log,
+            "dt_bias": self.dt_bias,
+            "initial_state": recurrent_state,
+            "output_final_state": use_cache,
+            "use_qk_l2norm_in_kernel": True,
+            "use_gate_in_kernel": True,
+            "use_beta_sigmoid_in_kernel": True,
+            "lower_bound": self.gate_lower_bound,
+            "transpose_state_layout": True,
+            "cu_seqlens": cu_seqlens,
+        }
+        if use_cache and q_len == 1:
+            core_out, recurrent_state = fused_recurrent_kda(query, key, value, **kda_kwargs)
+        else:
+            core_out, recurrent_state = chunk_kda(
+                query, key, value, safe_gate=self.gate_lower_bound is not None, **kda_kwargs
+            )
+
+        if use_cache:
+            past_key_values.update_conv_state(
+                torch.cat((conv_state_q, conv_state_k, conv_state_v), dim=1), self.layer_idx
+            )
+            past_key_values.update_recurrent_state(recurrent_state, self.layer_idx)
+
+        gate = self.g_b_proj(self.g_a_proj(hidden_states))
+        gate = gate.view(*gate.shape[:-1], -1, self.head_v_dim)
+        core_out = self.o_norm(core_out, gate)
+
+        output = self.o_proj(core_out.flatten(-2))
+        if indices is not None:
+            output = pad_input(output.squeeze(0), indices, batch_size, q_len)
+        return output, None
 
 
 # Dense gated MLP.
@@ -548,18 +757,14 @@ class Apertus2DecoderLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: Apertus2Config, layer_idx: int):
         super().__init__()
-        # Fail closed until the KDA module lands: building Apertus2Attention for a
-        # 'linear_attention' layer would silently produce a softmax model around KDA weights.
-        if config.layer_types[layer_idx] == "linear_attention":
-            raise NotImplementedError(
-                f"layer_types marks layer {layer_idx} as 'linear_attention' (KDA), which "
-                "modeling_apertus2 does not implement yet"
-            )
         self.hidden_size = config.hidden_size
         self.sandwich_norm = config.sandwich_norm
         self.residual_multiplier = config.residual_multiplier
 
-        self.self_attn = Apertus2Attention(config=config, layer_idx=layer_idx)
+        if config.layer_types[layer_idx] == "linear_attention":
+            self.self_attn = Apertus2KimiDeltaAttention(config, layer_idx)
+        else:
+            self.self_attn = Apertus2Attention(config=config, layer_idx=layer_idx)
 
         if config.is_moe_layer(layer_idx):
             self.mlp = Apertus2MoE(config)
@@ -661,12 +866,22 @@ class Apertus2PreTrainedModel(PreTrainedModel):
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
+
+    def post_init(self):
+        # KDA layers branch on cache state in Python and unpad with data-dependent shapes, so
+        # a hybrid model cannot be captured as one graph (Qwen3-Next leaves the flag off for
+        # the same reason). Softmax-only models keep the class default.
+        if "linear_attention" in self.config.layer_types:
+            self._can_compile_fullgraph = False
+        super().post_init()
     _can_record_outputs = {
         "hidden_states": Apertus2DecoderLayer,
         "attentions": Apertus2Attention,
     }
-    # Router offsets must survive low-precision checkpoint loading in float32.
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "qb_beta"]
+    # Router offsets must survive low-precision checkpoint loading in float32.  KDA's decay
+    # parameters stay fp32 as well, mirroring the fork's master copies and vLLM's loader (the
+    # checkpoint stores them bf16; the copy upcasts).
+    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "qb_beta", "A_log", "dt_bias"]
 
     def _reject_tensor_parallel(self) -> None:
         """Fail loudly on TP ranks: tensor parallelism is intentionally unsupported for now.
@@ -701,6 +916,15 @@ class Apertus2PreTrainedModel(PreTrainedModel):
         elif isinstance(module, Apertus2NaiveMoe):
             init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, Apertus2KimiDeltaAttention):
+            # The fork's reset_parameters: dt_bias starts at one; A_log starts at zero for the
+            # bounded gate (exp(A_log) = 1, the Kimi-Linear reference) and log-uniform(1, 16)
+            # for the unbounded softplus gate.
+            init.ones_(module.dt_bias)
+            if module.gate_lower_bound is not None:
+                init.zeros_(module.A_log)
+            else:
+                init.copy_(module.A_log, torch.empty_like(module.A_log).uniform_(1, 16).log_())
 
 
 # Base decoder model.
@@ -719,6 +943,7 @@ class Apertus2Model(Apertus2PreTrainedModel):
         self.norm = Apertus2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.has_sliding_layers = "sliding_attention" in config.layer_types
+        self.has_linear_layers = "linear_attention" in config.layer_types
         self.gradient_checkpointing = False
 
         self.post_init()
@@ -752,8 +977,9 @@ class Apertus2Model(Apertus2PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         # One mask per distinct layer type, because sliding layers admit fewer keys than full
-        # ones.  `generate` with a compiled cache prepares this dictionary itself and passes it in
-        # as attention_mask, so an already-built mapping is used as-is.
+        # ones and KDA layers consume the raw padding mask.  `generate` with a compiled cache
+        # prepares this dictionary itself and passes it in as attention_mask, so an
+        # already-built mapping is used as-is.
         if not isinstance(causal_mask_mapping := attention_mask, dict):
             mask_kwargs = {
                 "config": self.config,
@@ -762,9 +988,15 @@ class Apertus2Model(Apertus2PreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            causal_mask_mapping = {"full_attention": create_causal_mask(**mask_kwargs)}
+            causal_mask_mapping = {}
+            if "full_attention" in self.config.layer_types:
+                causal_mask_mapping["full_attention"] = create_causal_mask(**mask_kwargs)
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            if self.has_linear_layers:
+                causal_mask_mapping["linear_attention"] = self._linear_attention_mask(
+                    attention_mask, past_key_values
+                )
 
         # [B, S, H].  The fixed Megatron embedding scale applies to ids and prebuilt embeddings.
         hidden_states = inputs_embeds * self.config.embedding_multiplier
@@ -790,6 +1022,23 @@ class Apertus2Model(Apertus2PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
+
+    def _linear_attention_mask(
+        self, attention_mask: torch.Tensor | None, past_key_values: Cache | None
+    ) -> torch.Tensor | None:
+        """The 0/1 padding mask KDA layers consume, or ``None`` when padding cannot matter.
+
+        Cached decode steps extend a recurrent state that already excluded padded prefill
+        positions, and an all-ones mask carries no padding: both skip the unpad round-trip.
+        (Same rule as Qwen3-Next's ``_update_linear_attn_mask``; padding must be on the left
+        for cached generation, which is also what ``generate`` produces for decoder-only
+        models.)
+        """
+        if past_key_values is not None and past_key_values.has_previous_state():
+            return None
+        if attention_mask is not None and torch.all(attention_mask == 1):
+            return None
+        return attention_mask
 
 
 # Causal language-model head.

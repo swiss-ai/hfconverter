@@ -12,8 +12,13 @@ have found zero expert weights. These tests exist so that cannot happen again:
   TestHomogeneousKeys  -- pin the fork behavior that makes an int moe_layer_freq unreadable.
   TestRealCheckpointKeys  -- audit the REAL production checkpoint on scratch (TE spec), which is the
       only evidence for the TE-vs-local key differences and for the real geometry.
+  TestRealKdaCheckpointKeys  -- the KDA analogue: audit the real KDA smoke checkpoint (torch_dist,
+      TE spec) against derive_config + build_plan. Metadata-only, so it needs no FLA, no GPU, and
+      no HF KDA module. The fork-BUILD analogue (constructing a KDA model on CPU) is deferred:
+      GatedDeltaNet.__init__ raises without flash-linear-attention, which the pinned container
+      does not ship yet.
 
-They skip cleanly when the fork checkout / real checkpoint are unavailable.
+They skip cleanly when the fork checkout / real checkpoints are unavailable.
 """
 
 import os
@@ -40,6 +45,15 @@ WORKER = Path(__file__).parent / "_fork_dump_worker.py"
 REAL_CKPT = Path(
     "/iopsstor/scratch/cscs/mvasilev/Megatron-LM-MoE/_research/results/ckpts/"
     "1.5b-moe-128e-muonmd-lr1e-3-mlr1e-2-fp8-smoke/iter_0001192/mp_rank_00_000/model_optim_rng.pt"
+)
+
+# The KDA smoke run the mapping commits were verified against: 10 layers, KDA at
+# 0,1,2,4,5,6,8 (freq [1,1,1,0,1,1,1,0,1,0]), 6 heads x 128, safe gate g_min -5,
+# latent MoE, torch_dist format. iter_0000010 is latest_checkpointed_iteration.
+REAL_KDA_CKPT = Path(
+    "/iopsstor/scratch/cscs/mvasilev/Megatron-LM-MoE/_research/results/ckpts/"
+    "scaling-ladder/kda-1.5b-moe-256e-latent-kda31-nope-smoke-muonmd-lr2.83e-3-"
+    "mlr1.41e-2-latmoe-e256-top8-kda31-nope/iter_0000010"
 )
 
 # The fork's LOCAL layer spec renames pre_mlp_layernorm. -> mlp.linear_fc1.layer_norm_
@@ -302,3 +316,116 @@ class TestRealCheckpointKeys:
         # both scalar multipliers were ON in this run
         assert kwargs["embedding_multiplier"] == pytest.approx(768 ** 0.5)
         assert kwargs["residual_multiplier"] == pytest.approx(1.0 / (2 * 10) ** 0.5)
+
+
+@pytest.fixture(scope="module")
+def real_kda():
+    """Args + tensor metadata of the real KDA smoke checkpoint, via the production reader."""
+    from exporter.reader import load_args, load_metadata
+
+    args, _ = load_args(REAL_KDA_CKPT)
+    return {"args": args, "meta": load_metadata(REAL_KDA_CKPT)}
+
+
+@pytest.fixture(scope="module")
+def real_kda_plan(real_kda):
+    derived = derive_config(real_kda["args"])
+    return derived, build_plan(derived.kwargs, expert_bias_present=derived.expert_bias_present)
+
+
+# Every tensor the fork writes for one KDA layer (TE spec). The in_proj/conv1d entries are the
+# pre-split per-component keys from KimiDeltaAttention._in_proj_sharded_split; note there is NO
+# unsplit in_proj.weight, NO decay_out_proj.bias, and the output gate DOES carry a bias -- the
+# fork's one deviation from Kimi-Linear, which the mapping must forward.
+KDA_LAYER_KEYS = {
+    "in_proj.layer_norm_weight",
+    "in_proj.weight.query",
+    "in_proj.weight.key",
+    "in_proj.weight.value",
+    "in_proj.weight.decay_low_rank",
+    "in_proj.weight.gate_low_rank",
+    "in_proj.weight.beta",
+    "conv1d.weight.query",
+    "conv1d.weight.key",
+    "conv1d.weight.value",
+    "A_log",
+    "dt_bias",
+    "decay_out_proj.weight",
+    "gate_out_proj.weight",
+    "gate_out_proj.bias",
+    "out_norm.weight",
+    "out_proj.weight",
+}
+
+
+@pytest.mark.skipif(not REAL_KDA_CKPT.exists(), reason="real KDA smoke checkpoint not on this filesystem")
+class TestRealKdaCheckpointKeys:
+    """Audit the REAL KDA smoke checkpoint (TE spec, torch_dist) against the exporter.
+
+    megatron_mock.kda_attention_key_triples and mapping._kda_attention_rows were hand-written in
+    the same commits, so a shared wrong assumption is invisible to the mock round-trip tests --
+    exactly the 2026-07-14 failure mode this module exists for. This class is the KDA ground
+    truth: the on-disk namespace a real fork training run produced.
+    """
+
+    def test_derive_config_accepts_the_real_kda_training_args(self, real_kda_plan):
+        derived, _ = real_kda_plan
+        kwargs = derived.kwargs
+        kda, full = "linear_attention", "full_attention"
+        assert kwargs["layer_types"] == [kda, kda, kda, full, kda, kda, kda, full, kda, full]
+        assert kwargs["linear_num_key_heads"] == 6
+        assert kwargs["linear_num_value_heads"] == 6
+        assert kwargs["linear_key_head_dim"] == 128
+        assert kwargs["linear_value_head_dim"] == 128
+        assert kwargs["linear_conv_kernel_dim"] == 4
+        assert kwargs["gate_lower_bound"] == -5.0
+        assert kwargs["linear_attn_output_gate_bias"] is True  # fork always trains the bias
+        # this run: quantile-balancing router without expert bias
+        assert derived.expert_bias_present is False
+
+    def test_plan_bijects_the_real_kda_checkpoint(self, real_kda, real_kda_plan):
+        # The claim the KDA mapping commit makes: exact bijection of all 241 model tensors.
+        _, plan = real_kda_plan
+        model_keys = {k for k in real_kda["meta"] if not k.startswith("optimizer.")}
+        expected = {row.megatron_key for row in plan.rows}
+        missing = sorted(model_keys - expected)  # fork writes it, we would not consume it
+        extra = sorted(expected - model_keys)  # we demand it, fork does not write it
+        assert not missing, f"real KDA checkpoint has keys the exporter does not map: {missing}"
+        assert not extra, f"exporter expects keys the real KDA checkpoint lacks: {extra}"
+        assert len(model_keys) == 241
+
+    def test_plan_shapes_match_the_real_kda_checkpoint(self, real_kda, real_kda_plan):
+        _, plan = real_kda_plan
+        meta = real_kda["meta"]
+        for row in plan.rows:
+            assert tuple(meta[row.megatron_key].global_shape) == tuple(row.shape), (
+                f"{row.megatron_key}: checkpoint wrote "
+                f"{tuple(meta[row.megatron_key].global_shape)}, mapping expects {tuple(row.shape)}"
+            )
+
+    def test_kda_layer_writes_exactly_the_seventeen_expected_keys(self, real_kda):
+        prefix = "decoder.layers.0.self_attention."
+        on_disk = {k.removeprefix(prefix) for k in real_kda["meta"] if k.startswith(prefix)}
+        assert on_disk == KDA_LAYER_KEYS
+
+    def test_softmax_layers_keep_the_standard_attention_namespace(self, real_kda):
+        keys = set(real_kda["meta"])
+        assert "decoder.layers.3.self_attention.linear_qkv.weight" in keys
+        assert not any(
+            k.startswith("decoder.layers.3.self_attention.") and k.split(".", 4)[-1] in KDA_LAYER_KEYS
+            for k in keys
+        )
+
+    def test_kda_tensors_are_bf16_on_disk(self, real_kda):
+        # The fork constructs A_log/dt_bias as fp32 (kimi_delta_attention.py) but Float16Module
+        # downcasts the whole module, so on disk every KDA tensor is uniformly bf16 -- the fact
+        # that lets the mapping copy KDA rows without dtype pins. The only fp32 survivors are the
+        # router's qb_beta buffers, which have an explicit fp32-restore hook.
+        non_bf16 = {
+            k: str(meta.dtype)
+            for k, meta in real_kda["meta"].items()
+            if not k.startswith("optimizer.") and meta.dtype != torch.bfloat16
+        }
+        assert all(k.endswith("mlp.router.qb_beta") for k in non_bf16), non_bf16
+        assert set(non_bf16.values()) == {"torch.float32"}
+        assert len(non_bf16) == 9

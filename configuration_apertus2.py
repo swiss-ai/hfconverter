@@ -60,7 +60,10 @@ class Apertus2Config(PreTrainedConfig):
       their geometry comes from the ``linear_*`` fields, and ``gate_lower_bound`` selects the
       decay-gate form — a float ``g_min`` in ``[-5, 0)`` for the bounded Kimi-K3 gate
       ``g = g_min * sigmoid(exp(A_log) * (z + dt_bias))``, or ``None`` for the unbounded
-      ``g = -exp(A_log) * softplus(z + dt_bias)``.  KDA layers ignore RoPE and
+      ``g = -exp(A_log) * softplus(z + dt_bias)``.  ``linear_attn_output_gate_bias`` declares
+      whether the output gate's up-projection (``g_b_proj``) carries a trained bias — this
+      fork's exports always do, so an omitted field defaults to ``True`` on KDA models, while
+      Kimi-Linear-style checkpoints without the bias set ``False``.  KDA layers ignore RoPE and
       ``attention_output_gate`` (they carry their own sigmoid gate), and cannot be mixed with
       sliding-window layers in one model.
     - ``no_rope_layers`` marks each layer ``1`` (rotate) or ``0`` (NoPE).  The polarity follows
@@ -131,15 +134,19 @@ class Apertus2Config(PreTrainedConfig):
     no_rope_layers: list[int] | None = None
     # KDA (Kimi Delta Attention) geometry, active on the layers whose layer_types entry is
     # "linear_attention".  Field names follow Qwen3-Next; gate_lower_bound is the Kimi-K3 knob
-    # vLLM consumes.  All six stay None on a pure-softmax model.  The low-rank bottleneck width
-    # of the decay and output-gate projections is not a field: it equals linear_value_head_dim
-    # by KDA construction.
+    # vLLM consumes.  All seven stay None on a pure-softmax model.  The low-rank bottleneck
+    # width of the decay and output-gate projections is not a field: it equals
+    # linear_value_head_dim by KDA construction.  linear_attn_output_gate_bias declares whether
+    # g_b_proj carries a trained bias; on KDA models an absent field normalizes to True (this
+    # fork always trains the bias), while Kimi-Linear-style checkpoints without one must say
+    # False explicitly.
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
     linear_key_head_dim: int | None = None
     linear_value_head_dim: int | None = None
     linear_conv_kernel_dim: int | None = None
     gate_lower_bound: float | None = None
+    linear_attn_output_gate_bias: bool | None = None
     moe_intermediate_size: int = 448
     num_experts_per_tok: int = 4
     n_shared_experts: int = 1
@@ -331,6 +338,8 @@ class Apertus2Config(PreTrainedConfig):
             stray = {name: value for name, value in geometry.items() if value is not None}
             if self.gate_lower_bound is not None:
                 stray["gate_lower_bound"] = self.gate_lower_bound
+            if self.linear_attn_output_gate_bias is not None:
+                stray["linear_attn_output_gate_bias"] = self.linear_attn_output_gate_bias
             if stray:
                 raise ValueError(
                     "KDA fields are set but no layer_types entry is 'linear_attention'; the "
@@ -366,6 +375,11 @@ class Apertus2Config(PreTrainedConfig):
                 "[-5, 0) (the bounded Kimi-K3 gate; FlashKDA and vLLM assert the same range); "
                 f"got {self.gate_lower_bound!r}"
             )
+        # The fork always trains the output-gate bias, so an omitted field means "present";
+        # only a checkpoint that genuinely lacks g_b_proj.bias (upstream Kimi-Linear style)
+        # sets False, and the modeling code then builds the projection without one.
+        if self.linear_attn_output_gate_bias is None:
+            self.linear_attn_output_gate_bias = True
 
     def _set_full_rotary_defaults(self, kwargs: dict) -> None:
         """Configure RoPE over the entire attention head, never an accidental half-head."""

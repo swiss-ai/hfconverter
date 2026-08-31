@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 
 from configuration_apertus2 import Apertus2Config
+import modeling_apertus2
 from modeling_apertus2 import (
     Apertus2ForCausalLM,
     Apertus2MLP,
@@ -336,9 +337,11 @@ class TestTensorParallelUnsupported:
 
 
 class TestConfigValidation:
-    def test_kda_layers_fail_closed_at_model_construction(self, make_config):
-        # A valid KDA config must not silently build softmax attention around KDA weights
-        # until modeling_apertus2 actually implements linear_attention layers.
+    def test_kda_layers_never_degrade_to_softmax_attention(self, make_config):
+        # A valid KDA config must never silently build softmax attention around KDA weights:
+        # with flash-linear-attention installed the layer builds the KDA module, without it
+        # model construction fails loudly. The branch condition is the environment itself, so
+        # exactly one arm runs everywhere and neither environment skips.
         config = make_config(
             layer_types=["linear_attention", "full_attention", "full_attention"],
             linear_num_key_heads=2,
@@ -348,8 +351,53 @@ class TestConfigValidation:
             linear_conv_kernel_dim=4,
             gate_lower_bound=-5.0,
         )
-        with pytest.raises(NotImplementedError, match="linear_attention"):
-            Apertus2ForCausalLM(config)
+        if modeling_apertus2.chunk_kda is None:
+            with pytest.raises(ImportError, match="flash-linear-attention"):
+                Apertus2ForCausalLM(config)
+        else:
+            model = Apertus2ForCausalLM(config)
+            kda = modeling_apertus2.Apertus2KimiDeltaAttention
+            assert isinstance(model.model.layers[0].self_attn, kda)
+            assert not isinstance(model.model.layers[1].self_attn, kda)
+            # The fork trains the output-gate bias; the normalized config default builds it.
+            assert model.model.layers[0].self_attn.g_b_proj.bias is not None
+
+    def test_output_gate_bias_field_defaults_to_true_only_on_kda_configs(self, make_config):
+        # Omitted on a KDA config, the field normalizes to True (this fork always trains
+        # g_b_proj.bias); an explicit False survives for Kimi-Linear-style checkpoints.
+        kda_kwargs = dict(
+            layer_types=["linear_attention", "full_attention", "full_attention"],
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            gate_lower_bound=-5.0,
+        )
+        assert make_config(**kda_kwargs).linear_attn_output_gate_bias is True
+        no_bias = make_config(**kda_kwargs, linear_attn_output_gate_bias=False)
+        assert no_bias.linear_attn_output_gate_bias is False
+
+    def test_stray_output_gate_bias_field_rejected_without_kda_layers(self, make_config):
+        # Like the geometry fields: set without a 'linear_attention' layer it describes a
+        # different model than the schedule does, so construction must refuse.
+        with pytest.raises(ValueError, match="linear_attn_output_gate_bias"):
+            make_config(linear_attn_output_gate_bias=False)
+
+    def test_hybrid_config_softmax_layers_construct_without_fla(self, make_config):
+        # The per-layer dispatch must not pull the flash-linear-attention dependency into the
+        # softmax layers of a hybrid model: only 'linear_attention' layers may require it.
+        config = make_config(
+            layer_types=["linear_attention", "full_attention", "full_attention"],
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            gate_lower_bound=-5.0,
+        )
+        layer = modeling_apertus2.Apertus2DecoderLayer(config, layer_idx=1)
+        assert isinstance(layer.self_attn, modeling_apertus2.Apertus2Attention)
 
     def test_explicit_partial_rotary_factor_kwarg_rejected(self):
         with pytest.raises(ValueError, match="partial_rotary_factor"):

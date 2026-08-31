@@ -578,7 +578,15 @@ def _derive_linear_attention(
         f"linear_value_head_dim = {geometry['linear_value_head_dim']} (derived by KDA "
         "construction, not an independent arg)"
     )
-    return {**geometry, "gate_lower_bound": gate_lower_bound}
+    support.passed.append(
+        "this fork's gate_out_proj always trains a bias -> linear_attn_output_gate_bias = "
+        "True (g_b_proj.bias is exported; upstream Kimi-Linear checkpoints have none)"
+    )
+    return {
+        **geometry,
+        "gate_lower_bound": gate_lower_bound,
+        "linear_attn_output_gate_bias": True,
+    }
 
 
 def _validate_residual_scheme(args: Namespace, support: _SupportBoundary) -> None:

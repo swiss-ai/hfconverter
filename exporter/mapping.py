@@ -139,6 +139,7 @@ class _Geometry:
     linear_key_head_dim: int | None
     linear_value_head_dim: int | None
     linear_conv_kernel_dim: int | None
+    linear_attn_output_gate_bias: bool
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "_Geometry":
@@ -190,6 +191,11 @@ class _Geometry:
             linear_key_head_dim=config.get("linear_key_head_dim"),
             linear_value_head_dim=config.get("linear_value_head_dim"),
             linear_conv_kernel_dim=config.get("linear_conv_kernel_dim"),
+            # Absent means present, matching Apertus2Config's normalization (the fork always
+            # trains the output-gate bias); only an explicit False drops the bias row.
+            linear_attn_output_gate_bias=(
+                config.get("linear_attn_output_gate_bias") is not False
+            ),
         )
 
     @property
@@ -307,10 +313,12 @@ def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
     no fusion, split, or transpose. Hugging Face names follow the Kimi-Linear checkpoint
     spellings that vLLM's KDA loaders consume (q/k/v_proj, b_proj for beta, f_a/f_b_proj for
     the decay bottleneck, g_a/g_b_proj for the output-gate bottleneck, q/k/v_conv1d, A_log,
-    dt_bias, o_norm, o_proj), with one deviation: this fork's output gate carries a bias
-    (g_b_proj.bias), which Kimi-Linear does not. Both low-rank bottlenecks are
-    value_head_dim wide by KDA construction; dt_bias is per (value head x key channel),
-    flattened.
+    dt_bias, o_norm, o_proj), with one deviation: this fork's output gate trains a bias
+    (g_b_proj.bias), which Kimi-Linear does not. The bias row follows the config's
+    ``linear_attn_output_gate_bias`` (always True for this fork's exports — derive_config
+    pins it — so False only serves foreign, Kimi-Linear-style checkpoints). Both low-rank
+    bottlenecks are value_head_dim wide by KDA construction; dt_bias is per (value head x
+    key channel), flattened.
     """
     for name in ("linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim",
                  "linear_value_head_dim", "linear_conv_kernel_dim"):
@@ -329,7 +337,7 @@ def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
     decay_dim = num_value_heads * shape.linear_key_head_dim  # dt_bias / f_b output width
     kernel = shape.linear_conv_kernel_dim
 
-    return [
+    rows = [
         # The fused input norm rides on in_proj, like linear_qkv.layer_norm_weight elsewhere.
         Row(
             f"{megatron}.in_proj.layer_norm_weight",
@@ -363,14 +371,20 @@ def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
             (decay_dim, low_rank)),
         Row(f"{megatron}.gate_out_proj.weight", (f"{hf}.g_b_proj.weight",), COPY,
             (value_dim, low_rank)),
-        Row(f"{megatron}.gate_out_proj.bias", (f"{hf}.g_b_proj.bias",), COPY,
-            (value_dim,)),
+    ]
+    if shape.linear_attn_output_gate_bias:
+        rows.append(
+            Row(f"{megatron}.gate_out_proj.bias", (f"{hf}.g_b_proj.bias",), COPY,
+                (value_dim,))
+        )
+    rows += [
         # Per-value-head sigmoid-gated RMSNorm scale.
         Row(f"{megatron}.out_norm.weight", (f"{hf}.o_norm.weight",), COPY,
             (shape.linear_value_head_dim,)),
         Row(f"{megatron}.out_proj.weight", (f"{hf}.o_proj.weight",), COPY,
             (hidden, value_dim)),
     ]
+    return rows
 
 
 def _post_norm_rows(layer_index: int, shape: _Geometry) -> list[Row]:

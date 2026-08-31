@@ -744,6 +744,9 @@ class TestLinearAttentionDerivation:
         assert config.linear_value_head_dim == 8
         assert config.linear_conv_kernel_dim == 4
         assert config.gate_lower_bound == -5.0
+        # The fork's gate_out_proj always trains a bias, so the derivation pins the field
+        # explicitly rather than leaning on the config default.
+        assert config.linear_attn_output_gate_bias is True
 
     def test_unsafe_gate_exports_a_none_lower_bound(self):
         # gate_lower_bound=None must mean "softplus decay gate", not "default to -5".
@@ -762,6 +765,7 @@ class TestLinearAttentionDerivation:
         assert config.layer_types == ["full_attention"] * 3
         assert config.linear_num_key_heads is None
         assert config.gate_lower_bound is None
+        assert config.linear_attn_output_gate_bias is None
 
     def test_checkpoints_predating_the_variant_field_are_accepted(self):
         args = good_args()

@@ -4,9 +4,9 @@ The KDA key layout is pinned independently in megatron_mock.kda_attention_key_tr
 fork pre-splits the fused in_proj/conv1d at save time, so every KDA tensor is a COPY row).
 These tests require the production plan to consume and produce exactly those names, push
 tensors through convert() demanding bit-identity, and run one full in-process export whose
-config.json must carry the KDA fields. Model-level round trips (from_pretrained) stay
-impossible on purpose until the KDA module lands: modeling_apertus2 fails closed on
-'linear_attention' layers, which the last test pins.
+config.json must carry the KDA fields. Model-level round trips (from_pretrained) need
+flash-linear-attention: modeling_apertus2's KDA module runs on its kernels and refuses to
+construct without the package, which the last test pins for both environments.
 """
 
 import json
@@ -76,6 +76,28 @@ class TestKdaPlan:
         assert all(row.dtype is None for row in kda_rows)
         assert {key for row in kda_rows for key in row.hf_keys} == set(expected_hf)
 
+    def test_output_gate_bias_row_follows_the_config_field(self):
+        # derive_config pins linear_attn_output_gate_bias=True for this fork (gate_out_proj
+        # always trains a bias); an explicit False must drop exactly the bias row on every
+        # KDA layer so a Kimi-Linear-style checkpoint without the key still bijects.
+        _, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
+        derived = config_from_args.derive_config(args)
+        assert derived.kwargs["linear_attn_output_gate_bias"] is True
+
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present)
+        no_bias_kwargs = {**derived.kwargs, "linear_attn_output_gate_bias": False}
+        no_bias_plan = mapping.build_plan(no_bias_kwargs, derived.expert_bias_present)
+
+        dropped = mapping.expected_consumed(plan) - mapping.expected_consumed(no_bias_plan)
+        assert dropped == {
+            f"decoder.layers.{layer}.self_attention.gate_out_proj.bias"
+            for layer, is_kda in enumerate(megatron_mock.TINY_KDA_PATTERN) if is_kda
+        }
+        assert not any(
+            key.endswith("g_b_proj.bias")
+            for row in no_bias_plan.rows for key in row.hf_keys
+        )
+
     def test_incomplete_kda_geometry_is_rejected(self):
         _, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
         derived = config_from_args.derive_config(args)
@@ -136,15 +158,23 @@ class TestKdaExportEndToEnd:
             assert hf_key in written, hf_key
             assert torch.equal(written[hf_key], reference), hf_key
 
-    def test_verify_load_fails_closed_until_the_kda_module_lands(
-        self, dist_env, export_expect_failure, tmp_path
+    def test_verify_load_requires_flash_linear_attention(
+        self, dist_env, export_api, export_expect_failure, tmp_path
     ):
-        # --verify-load builds the HF model, which must refuse linear_attention layers today;
-        # this test starts failing (and gets replaced by a real load check) with the KDA module.
+        # --verify-load builds the HF model, whose KDA layers run on flash-linear-attention:
+        # with the package installed the exported dir must load back cleanly, and without it
+        # the load must fail loudly instead of silently building softmax attention around KDA
+        # weights. The branch condition is the environment itself, so neither environment
+        # skips.
+        from modeling_apertus2 import chunk_kda
+
         tensors, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
         checkpoint_dir = tmp_path / "ckpt"
         megatron_mock.save_synthetic_checkpoint(tensors, args, checkpoint_dir)
-        blob = export_expect_failure(
-            checkpoint_dir, tmp_path / "out", "--verify-load"
-        )
-        assert "linear_attention" in blob
+        if chunk_kda is None:
+            blob = export_expect_failure(
+                checkpoint_dir, tmp_path / "out", "--verify-load"
+            )
+            assert "flash-linear-attention" in blob
+        else:
+            export_api(checkpoint_dir, tmp_path / "out", "--verify-load")
