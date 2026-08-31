@@ -20,12 +20,14 @@ mapping and writing code.
 """
 
 import logging
+import pickle
 import socket
 import warnings
 from argparse import Namespace
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -98,9 +100,56 @@ def check_checkpoint(ckpt_dir: str | Path) -> None:
         raise ValueError(f"not a Megatron torch_dist distributed checkpoint: {ckpt_dir}")
 
 
+class _ForkObjectStub:
+    """Placeholder for fork-only classes pickled into ``common.pt``.
+
+    Newer fork training runs pickle fork-defined objects into the common state dict (first seen:
+    ``megatron.core.tokenizers.utils.tokenizer_extra_metadata.TokenizerExtraMetadata`` in the KDA
+    smoke run). HF-side runs pin stock Megatron Core, which lacks fork-added modules, so those
+    globals cannot resolve — but :func:`load_args` only needs ``common['args']``, a stdlib
+    ``Namespace``. Auxiliary fork objects just have to unpickle into *something*.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __setstate__(self, state: Any) -> None:
+        self._pickled_state = state
+
+
+class _TolerantUnpickler(pickle.Unpickler):
+    """Resolve unimportable pickle globals to :class:`_ForkObjectStub` instead of failing."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        try:
+            return super().find_class(module, name)
+        except (ImportError, AttributeError):
+            logger.warning(
+                "common.pt references %s.%s, which is unavailable outside the fork; "
+                "loading it as a stub", module, name,
+            )
+            return _ForkObjectStub
+
+
+# torch.load wants a module-shaped object; only .Unpickler and .__name__ are touched for
+# zip-format checkpoints.
+_TOLERANT_PICKLE = SimpleNamespace(Unpickler=_TolerantUnpickler, __name__="tolerant_pickle")
+
+
 def load_args(ckpt_dir: str | Path) -> tuple[Namespace, dict[str, Any]]:
     """Read training arguments from ``common.pt`` without loading tensor data."""
-    common = dist_checkpointing.load_common_state_dict(str(ckpt_dir))
+    try:
+        common = dist_checkpointing.load_common_state_dict(str(ckpt_dir))
+    except pickle.UnpicklingError:
+        # Megatron Core 0.18's load_common defers to torch.load's weights_only=True default,
+        # which refuses any pickled non-tensor class. The checkpoint comes from the user's own
+        # training run, so load permissively, stubbing fork-only globals (see _ForkObjectStub).
+        common = torch.load(
+            Path(ckpt_dir) / "common.pt",
+            map_location="cpu",
+            weights_only=False,
+            pickle_module=_TOLERANT_PICKLE,
+        )
     if "args" not in common:
         raise ValueError(f"checkpoint has no 'args' entry in its common state dict: {ckpt_dir}")
     return common["args"], common
