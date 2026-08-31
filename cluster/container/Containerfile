@@ -74,6 +74,7 @@ RUN pip install --no-cache-dir \
         hf_xet==1.5.1 \
         pytest==9.1.1 \
         emerging-optimizers==0.3.0 \
+        flash-linear-attention==0.5.2 \
         absl-py regex typer httpx click
 
 # Fail the BUILD (not the first job) if the resolver clobbered torch, a
@@ -92,6 +93,60 @@ from emerging_optimizers.scalar_optimizers import Lion; \
 assert importlib.util.find_spec('triton') is not None, 'triton missing: the fork *_jit kernels need it'; \
 print('deps OK: python', sys.version.split()[0], '| torch', torch.__version__, \
       '| transformers', transformers.__version__)"
+
+# KDA: flash-linear-attention 0.5.2 provides the fla.ops.kda kernels that both
+# modeling_apertus2.Apertus2KimiDeltaAttention and the fork's KimiDeltaAttention wrapper run
+# on (fla-core's only hard dependency is einops — the base torch/triton stay untouched).
+# Assert the exact surface the HF module imports plus the kwargs it passes (state_v_first is
+# the 0.5.x rename of transpose_state_layout; the fused decay gate reads A_log/dt_bias), so
+# an FLA bump that drops any of them fails the build, not the first KDA job. Moonshot's
+# optional FlashKDA CUTLASS backend (fla/ops/kda/backends/flash_kda.py) stays absent: the
+# flash_kda package is GitHub-source-only, and fla's Triton path — what the fork trains
+# with — is the default.
+RUN python -c "\
+import inspect; \
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input; \
+from fla.modules import FusedRMSNormGated, ShortConvolution; \
+from fla.ops.kda import chunk_kda, fused_recurrent_kda; \
+chunk_params = inspect.signature(chunk_kda).parameters; \
+recurrent_params = inspect.signature(fused_recurrent_kda).parameters; \
+needed = ('use_qk_l2norm_in_kernel', 'use_gate_in_kernel', 'use_beta_sigmoid_in_kernel', \
+          'lower_bound', 'state_v_first', 'cu_seqlens'); \
+missing = [n for n in needed + ('safe_gate',) if n not in chunk_params]; \
+assert not missing, 'chunk_kda lost kwargs: %s' % missing; \
+missing = [n for n in needed + ('A_log', 'dt_bias') if n not in recurrent_params]; \
+assert not missing, 'fused_recurrent_kda lost kwargs: %s' % missing; \
+import fla; \
+print('fla OK:', fla.__version__)"
+
+# vLLM personality for testing exported KDA checkpoints against the production consumer.
+# vllm 0.28.0 pins torch==2.13.0, which must NEVER replace the NGC base torch (TE and the
+# fork depend on it), so vllm lives in its own venv with its own torch: use
+# /opt/vllm/bin/python for vLLM jobs, plain python for everything else. The pip aarch64
+# wheel ships the full kimi_k3 kernel set — Moonshot's FlashKDA CUTLASS prefill kernel
+# (vllm/_flashkda_C.abi3.so, verified in the wheel listing), upstream's fused KDA decode
+# kernel, and the vendored Triton fallbacks — and is_flashkda_supported holds on GH200
+# (sm90, head_dim 128, bf16, bounded gate), so the "auto" backend serves KDA with FlashKDA
+# out of the box. To run the apertus2/k3 vLLM checkout: /opt/vllm/bin/pip install -e
+# <checkout> --no-deps at job time (deps are all here) with the wheel's .so files carried
+# over, e.g. VLLM_USE_PRECOMPILED — plain PYTHONPATH does NOT work, vllm is a regular
+# package, so the megatron namespace-merge trick does not apply.
+# PIP_CONSTRAINT: the NGC base exports a global constraint file that pins its own CUDA
+# stack (e.g. nvidia-cudnn-frontend==1.17.0, conflicting with vllm's >=1.19.1). Keeping it
+# is exactly what stops the SYSTEM pip installs from clobbering torch, but the isolated
+# venv must resolve vllm's own tree, so clear it for this install only (build job 3245761
+# died on ResolutionImpossible without this).
+RUN python -m venv /opt/vllm \
+ && PIP_CONSTRAINT= /opt/vllm/bin/pip install --no-cache-dir vllm==0.28.0 \
+ && /opt/vllm/bin/python -c "\
+import vllm, torch; \
+assert vllm.__version__ == '0.28.0', vllm.__version__; \
+assert torch.__version__.startswith('2.13.0'), torch.__version__; \
+assert torch.version.cuda, 'venv torch is a CPU wheel'; \
+print('vllm venv OK:', vllm.__version__, '| torch', torch.__version__)" \
+ && python -c "\
+import torch; assert not torch.__version__.startswith('2.13.'), \
+'system torch was clobbered by the vllm install: %s' % torch.__version__"
 
 # Record what this image can and cannot run on the fork side, so nobody
 # rediscovers it with a 64-GPU job (as 2894013 did).
