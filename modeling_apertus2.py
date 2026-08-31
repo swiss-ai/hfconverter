@@ -463,7 +463,11 @@ class Apertus2KimiDeltaAttention(nn.Module):
             "use_gate_in_kernel": True,
             "use_beta_sigmoid_in_kernel": True,
             "lower_bound": self.gate_lower_bound,
-            "transpose_state_layout": True,
+            # [heads, value_dim, key_dim] recurrent-state layout, as the Kimi reference code
+            # requests; flash-linear-attention 0.5.x renamed the kwarg from the deprecated
+            # transpose_state_layout. Only internal consistency between the chunk and
+            # fused-recurrent paths matters here — the state never leaves the cache.
+            "state_v_first": True,
             "cu_seqlens": cu_seqlens,
         }
         if use_cache and q_len == 1:
