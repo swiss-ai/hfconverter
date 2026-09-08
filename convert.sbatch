@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Important knobs (override via env).
 DEBUG=${DEBUG:-0}
 
-TOKENIZER=${TOKENIZER:-/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok}
+TOKENIZER=${TOKENIZER:-/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/Apertus-v1.5-8B-a411d838}
 
 NPROC_PER_NODE=${NPROC_PER_NODE:-2}
 TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-2}
@@ -25,7 +25,7 @@ MASTER_PORT=${MASTER_PORT:-29500}
 DISTRIBUTED_TIMEOUT_MINUTES=${DISTRIBUTED_TIMEOUT_MINUTES:-60}
 
 MEGATRON_REPO=${MEGATRON_REPO:-https://github.com/swiss-ai/Megatron-LM.git}
-MEGATRON_BRANCH=${MEGATRON_BRANCH:-multimodality/main}
+MEGATRON_BRANCH=${MEGATRON_BRANCH:-430aa60676c4f9f832ad18b8ce30e6740fe7ad2f}
 
 HFCONVERTER_REPO=${HFCONVERTER_REPO:-https://github.com/swiss-ai/hfconverter.git}
 HFCONVERTER_BRANCH=${HFCONVERTER_BRANCH:-main}
@@ -178,13 +178,14 @@ else
 fi || pause_for_debug $?
 
 echo "Dependency installation disabled; using environment as-is."
-srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" bash -c " \
+srun -ul --cpu-bind=none --mpi=none --network=disable_rdzv_get --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" bash -c " \
     echo 'Running torchdist->torch'
     echo \"NODE_RANK=\${SLURM_NODEID}\"
     cd ${MEGATRON_PATH}
-    export PYTHONPATH=${MEGATRON_PATH}
+    export PYTHONPATH=\"${MEGATRON_PATH}\"
+    \"\${HFCONVERTER_PYTHON:-python}\" \"${PATH_TO_HFCONVERTER}/check_megatron_source.py\" \"${MEGATRON_PATH}\" || exit
     export CUDA_DEVICE_MAX_CONNECTIONS=1
-    torchrun \
+    \"\${HFCONVERTER_PYTHON:-python}\" -m torch.distributed.run \
         --nnodes=$SLURM_NNODES \
         --nproc-per-node=$NPROC_PER_NODE \
         --node-rank=\${SLURM_NODEID} \
@@ -207,7 +208,7 @@ srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --
 
 TORCH_SAVE_DIR="$TORCH_NODIST_PATH/torch"
 
-srun -ul --nodes=1 --ntasks=1 --environment="$RUN_ENV" bash -c "set -eux
+srun -ul --cpu-bind=none --mpi=none --network=disable_rdzv_get --nodes=1 --ntasks=1 --environment="$RUN_ENV" bash -c "set -eux
   echo 'Stage1 output dir: $TORCH_SAVE_DIR'
   ls -lah '$TORCH_SAVE_DIR'
   echo 'Look for torch_dist artifacts (should be EMPTY for legacy torch):'
@@ -217,12 +218,13 @@ srun -ul --nodes=1 --ntasks=1 --environment="$RUN_ENV" bash -c "set -eux
   find '$TORCH_SAVE_DIR' -maxdepth 4 -path '*/mp_rank_*/*model_optim_rng.pt' -print | head
 "
 
-srun -ul --nodes=1 --ntasks=1 --environment="$RUN_ENV" bash -c " \
+srun -ul --cpu-bind=none --mpi=none --network=disable_rdzv_get --nodes=1 --ntasks=1 --environment="$RUN_ENV" bash -c " \
     export CUDA_DEVICE_MAX_CONNECTIONS=1
     echo 'Running torch->hf'
     cd ${MEGATRON_PATH}
-    export PYTHONPATH=${MEGATRON_PATH}
-    python tools/checkpoint/convert.py \
+    export PYTHONPATH=\"${MEGATRON_PATH}\"
+    \"\${HFCONVERTER_PYTHON:-python}\" \"${PATH_TO_HFCONVERTER}/check_megatron_source.py\" \"${MEGATRON_PATH}\" || exit
+    \"\${HFCONVERTER_PYTHON:-python}\" tools/checkpoint/convert.py \
         --model-type=GPT \
         --loader=core \
         --saver=swissai_hf \

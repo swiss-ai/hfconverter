@@ -3,6 +3,13 @@
 Utilities for converting Apertus Megatron checkpoints to HuggingFace format and checking
 native-vs-HF logits.
 
+The conversion image now uses **NeMo 26.08.00**, providing **Transformers
+5.12.1** and **tokenizers 0.22.2**. `nemo.toml` points to the shared ARM64
+SquashFS on CSCS. Apertus 1.5's validated training checkout uses **MCore
+0.16.0rc0**; NeMo bundles **MCore 0.19.0**. Both conversion stages export the
+selected Megatron checkout through `PYTHONPATH` and check its resolved module
+paths before using it. See [image versions and exact validation scope](docs/nemo-26.08.md).
+
 ## Megatron -> HF
 
 Set the topology explicitly to match the checkpoint. The conversion launcher checks:

@@ -3,13 +3,13 @@
 set -euo pipefail
 
 if [[ "${SKIP_TRANSFORMERS_INSTALL}" != "1" && -n "${TRANSFORMERS_BRANCH}" ]]; then
-  pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
+  "${HFCONVERTER_PYTHON:-python}" -m pip install -v --no-cache-dir --no-build-isolation --no-deps --force-reinstall -U \
     "transformers @ git+https://github.com/swiss-ai/transformers.git@${TRANSFORMERS_BRANCH}"
-  pip install -v --no-cache-dir -U "huggingface-hub>=0.34.0,<1.0"
+  "${HFCONVERTER_PYTHON:-python}" -m pip install -v --no-cache-dir -U "huggingface-hub>=0.34.0,<1.0"
 fi
 
 cmd=(
-  python "${PY_SCRIPT}"
+  "${HFCONVERTER_PYTHON:-python}" "${PY_SCRIPT}"
   --hf-dir "${HF_CKPT_DIR}"
   --prompt "${PROMPT}"
   --out-pt "${OUT_PT}"

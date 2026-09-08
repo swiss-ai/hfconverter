@@ -150,6 +150,6 @@ SRUN_EXPORTS=(
   "TRANSFORMERS_BRANCH=${TRANSFORMERS_BRANCH}"
   "SKIP_TRANSFORMERS_INSTALL=${SKIP_TRANSFORMERS_INSTALL}"
 )
-srun -ul --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
+srun -ul --cpu-bind=none --mpi=none --network=disable_rdzv_get --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
 
 echo "END TIME: $(date)"

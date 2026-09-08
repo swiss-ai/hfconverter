@@ -1,9 +1,19 @@
-image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
+image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nemo-26.08.00-aarch64.sqsh"
 
 mounts = ["/capstor", "/iopsstor", "/users"]
 writable = true
 workdir = "/workspace"
 
+[env]
+# Launchers use this absolute interpreter even if mounted shell profiles alter PATH.
+HFCONVERTER_PYTHON = "/opt/venv/bin/python"
+PATH = "/opt/venv/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin"
+PYTHONNOUSERSITE = "1"
+PMIX_MCA_psec = "native"
+FI_MR_CACHE_MAX_SIZE = "-1"
+FI_MR_CACHE_MAX_COUNT = "524288"
+FI_CXI_SAFE_DEVMEM_COPY_THRESHOLD = "16777216"
+FI_MR_CACHE_MONITOR = "userfaultfd"
+
 [annotations]
-com.hooks.aws_ofi_nccl.enabled = "true"
-com.hooks.aws_ofi_nccl.variant = "cuda12"
+com.hooks.cxi.enabled = "false"
