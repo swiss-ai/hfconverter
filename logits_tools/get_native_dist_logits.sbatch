@@ -32,7 +32,7 @@ usage() {
     echo "  RUN_ENV=~/hfconverter/nemo.toml        # same container env as convert.sbatch"
     echo "  LOCAL_MEGATRON_PATH=/path/to/Megatron-LM"
     echo "  MEGATRON_REPO=https://github.com/swiss-ai/Megatron-LM.git"
-    echo "  MEGATRON_BRANCH=multimodality/main"
+    echo "  MEGATRON_BRANCH=430aa60676c4f9f832ad18b8ce30e6740fe7ad2f"
     echo "  TOKENIZER=/path/to/hf-tokenizer        # override checkpoint tokenizer_model"
 }
 
@@ -104,7 +104,7 @@ fi
 
 RUN_ENV="${RUN_ENV:-${PATH_TO_HFCONVERTER}/nemo.toml}"
 MEGATRON_REPO="${MEGATRON_REPO:-https://github.com/swiss-ai/Megatron-LM.git}"
-MEGATRON_BRANCH="${MEGATRON_BRANCH:-multimodality/main}"
+MEGATRON_BRANCH="${MEGATRON_BRANCH:-430aa60676c4f9f832ad18b8ce30e6740fe7ad2f}"
 LOCAL_MEGATRON_PATH="${LOCAL_MEGATRON_PATH:-${PATH_TO_HFCONVERTER}/Megatron-LM}"
 MEGATRON_TEMP_PATH_ROOT="${SCRATCH:-/iopsstor/scratch/cscs/${USER}}/.megatron_tmp/.logits_megatron_tmp_${SLURM_JOB_ID}"
 
@@ -212,6 +212,6 @@ SRUN_EXPORTS=(
   "MASTER_PORT=${MASTER_PORT}"
   "DISTRIBUTED_TIMEOUT_MINUTES=${DISTRIBUTED_TIMEOUT_MINUTES}"
 )
-srun -ul --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
+srun -ul --cpu-bind=none --mpi=none --network=disable_rdzv_get --nodes="$SLURM_NNODES" --ntasks="$SLURM_NNODES" --ntasks-per-node=1 --environment="$RUN_ENV" env "${SRUN_EXPORTS[@]}" "$INNER_SCRIPT"
 
 echo "END TIME: $(date)"

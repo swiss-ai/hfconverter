@@ -5,10 +5,11 @@ set -euo pipefail
 echo "NODE_RANK=${SLURM_NODEID}"
 cd "${MEGATRON_PATH}"
 export PYTHONPATH="${MEGATRON_PATH}"
+"${HFCONVERTER_PYTHON:-python}" "$(dirname "${BASH_SOURCE[0]}")/../check_megatron_source.py" "${MEGATRON_PATH}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 cmd=(
-  torchrun
+  "${HFCONVERTER_PYTHON:-python}" -m torch.distributed.run
   --nnodes="${SLURM_NNODES}"
   --nproc-per-node="${NPROC_PER_NODE}"
   --node-rank="${SLURM_NODEID}"

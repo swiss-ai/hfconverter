@@ -1,24 +1,10 @@
-
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3
-ARG TRANSFORMERS_BRANCH=aimv2-fix
-ARG MEGATRON_BRANCH=main
-
+# Conversion dependencies come directly from the official NeMo image.
+# CSCS uses a copy of this image; no derived image build is required.
+ARG BASE_IMAGE=nvcr.io/nvidia/nemo:26.08.00@sha256:ac012c8d5b7b72fe60ca53e2519175fa8c27966b2d2f8efe6d1ed0559aff4ba0
 FROM ${BASE_IMAGE}
 
 WORKDIR /workspace
 
-# Install dependencies.
-RUN pip install --no-deps --no-build-isolation git+https://github.com/nickjbrowning/XIELU.git@main
-
-RUN git clone https://github.com/swiss-ai/transformers.git && \
-    cd transformers && \
-    git checkout $TRANSFORMERS_BRANCH && \
-    pip install -e . && \
-    cd ..
-
-RUN git clone https://github.com/swiss-ai/Megatron-LM.git && \
-    cd Megatron-LM && \
-    git checkout $MEGATRON_BRANCH && \
-    cd ..
-
-RUN pip install nvidia-modelopt==0.27.0
+# NeMo provides Transformers 5.12.1 and tokenizers 0.22.2. Keep its package
+# stack unchanged. The repository launchers export the checkpoint-compatible
+# Megatron source through PYTHONPATH and reject fallback to bundled MCore 0.19.
