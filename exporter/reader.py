@@ -117,6 +117,19 @@ class _ForkObjectStub:
         self._pickled_state = state
 
 
+# These training-only dataclasses are not needed by the HF model. Map their exact
+# pickle names to an inert placeholder during both common-state and tensor loads:
+# Megatron re-reads common.pt on every dist_checkpointing.load() call. A scoped
+# allowlist keeps weights-only loading enabled and leaves unrelated globals alone.
+_TOKENIZER_METADATA_GLOBALS = [
+    (
+        _ForkObjectStub,
+        f"megatron.core.tokenizers.utils.tokenizer_extra_metadata.{name}",
+    )
+    for name in ("TokenizerExtraMetadata", "ModelSpecialTokens")
+]
+
+
 class _TolerantUnpickler(pickle.Unpickler):
     """Resolve unimportable pickle globals to :class:`_ForkObjectStub` instead of failing."""
 
@@ -139,7 +152,8 @@ _TOLERANT_PICKLE = SimpleNamespace(Unpickler=_TolerantUnpickler, __name__="toler
 def load_args(ckpt_dir: str | Path) -> tuple[Namespace, dict[str, Any]]:
     """Read training arguments from ``common.pt`` without loading tensor data."""
     try:
-        common = dist_checkpointing.load_common_state_dict(str(ckpt_dir))
+        with torch.serialization.safe_globals(_TOKENIZER_METADATA_GLOBALS):
+            common = dist_checkpointing.load_common_state_dict(str(ckpt_dir))
     except pickle.UnpicklingError:
         # Megatron Core 0.18's load_common defers to torch.load's weights_only=True default,
         # which refuses any pickled non-tensor class. The checkpoint comes from the user's own
@@ -192,8 +206,8 @@ def load_tensors(
                 f"checkpoint is missing {len(missing)} expected tensor(s): {sorted(missing)[:8]}"
             )
         metadata = {k: v for k, v in metadata.items() if k in wanted}
-    plain = dist_checkpointing.load(
-        metadata, str(ckpt_dir), validate_access_integrity=False
-    )
+    with torch.serialization.safe_globals(_TOKENIZER_METADATA_GLOBALS):
+        plain = dist_checkpointing.load(
+            metadata, str(ckpt_dir), validate_access_integrity=False
+        )
     return {k: v for k, v in plain.items() if isinstance(v, torch.Tensor)}
-
