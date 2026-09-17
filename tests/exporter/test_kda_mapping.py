@@ -152,6 +152,11 @@ class TestKdaExportEndToEnd:
         assert config["linear_value_head_dim"] == megatron_mock.TINY_KDA_HEAD_DIM
         assert config["linear_conv_kernel_dim"] == megatron_mock.TINY_KDA_CONV_KERNEL
         assert config["gate_lower_bound"] == -5.0
+        # vLLM's hybrid class; the HF side still loads through the unchanged auto_map.
+        assert config["architectures"] == ["Apertus2KDAForCausalLM"]
+        assert config["auto_map"]["AutoModelForCausalLM"] == (
+            "modeling_apertus2.Apertus2ForCausalLM"
+        )
 
         written = load_file(str(output_dir / "model.safetensors"))
         for hf_key, reference in expected_hf.items():

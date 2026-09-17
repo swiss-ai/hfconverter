@@ -165,7 +165,11 @@ def write_config(
             "(bos/eos/pad). Verify them against the training tokenizer before using this model."
         )
     config = configuration.Apertus2Config(**cfg_kwargs)
-    config.architectures = ["Apertus2ForCausalLM"]
+    # vLLM dispatches on this name. The hybrid class exists only so that KDA exports size the
+    # GDN state cache while every pure-softmax export keeps its old class (is_hybrid is a class
+    # property there). HF ignores it: trust_remote_code loads through auto_map below.
+    has_kda = "linear_attention" in (config.layer_types or [])
+    config.architectures = ["Apertus2KDAForCausalLM" if has_kda else "Apertus2ForCausalLM"]
     # AutoModel is listed as well as AutoModelForCausalLM: without it,
     # AutoModel.from_pretrained(dir, trust_remote_code=True) raises "Unrecognized configuration
     # class ... for this kind of AutoModel" and any recipient whose tooling loads the BACKBONE
