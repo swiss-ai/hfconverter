@@ -323,9 +323,10 @@ class Apertus2KimiDeltaAttention(nn.Module):
     the geometry comes from the flat ``linear_*`` config fields (not a nested
     ``linear_attn_config``), ``config.linear_attn_output_gate_bias`` selects whether
     ``g_b_proj`` carries a trained bias inside the output-gate sigmoid pre-activation (this
-    fork always trains one, Kimi-Linear never does — dropping a trained bias would shift
-    every gate), and ``o_norm`` honors ``config.rms_norm_eps`` instead of a hardcoded
-    default.
+    fork's older checkpoints train one — dropping a trained bias would shift every gate),
+    and ``o_norm`` honors ``config.rms_norm_eps`` instead of a hardcoded default.
+    ``linear_attn_a_log_per_channel`` additionally preserves Megatron's optional learned
+    decay scale per key channel instead of sharing one scale across each head.
 
     The attention mask must be the 0/1 ``[batch, seq_len]`` padding mask (or ``None``); the
     layer unpads to one packed sequence with document boundaries so padded positions never
@@ -369,14 +370,16 @@ class Apertus2KimiDeltaAttention(nn.Module):
         self.f_b_proj = nn.Linear(self.head_v_dim, self.decay_dim, bias=False)
         # fp32 like the fork's master copies; _keep_in_fp32_modules_strict preserves that
         # through low-precision checkpoint loading.
-        self.A_log = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
+        self.a_log_per_channel = config.linear_attn_a_log_per_channel
+        self.A_log = nn.Parameter(torch.empty(
+            self.decay_dim if self.a_log_per_channel else self.num_heads, dtype=torch.float32
+        ))
         self.dt_bias = nn.Parameter(torch.empty(self.decay_dim, dtype=torch.float32))
 
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
         # The config declares whether the output-gate up-projection carries a trained bias
-        # inside the sigmoid pre-activation: this fork's checkpoints always do, upstream
-        # Kimi-Linear's never do. State-dict keys then describe the architecture exactly.
+        # inside the sigmoid pre-activation. State-dict keys describe the architecture exactly.
         self.g_a_proj = nn.Linear(self.hidden_size, self.head_v_dim, bias=False)
         self.g_b_proj = nn.Linear(
             self.head_v_dim, self.value_dim, bias=config.linear_attn_output_gate_bias
@@ -386,6 +389,18 @@ class Apertus2KimiDeltaAttention(nn.Module):
             self.head_v_dim, eps=config.rms_norm_eps, activation="sigmoid"
         )
         self.o_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def _activate_channel_decay(self, decay: torch.Tensor) -> torch.Tensor:
+        """Megatron's per-channel decay, without assuming FLA supports vector A_log.
+
+        Both prefill and cached decode accept an already activated FP32 log-decay.
+        Keep the legacy per-head fused path unchanged.
+        """
+        scale = self.A_log.float().exp().view(self.num_heads, self.head_k_dim)
+        shifted = decay.float() + self.dt_bias.float().view(self.num_heads, self.head_k_dim)
+        if self.gate_lower_bound is not None:
+            return self.gate_lower_bound * torch.sigmoid(scale * shifted)
+        return -scale * F.softplus(shifted)
 
     def forward(
         self,
@@ -470,6 +485,10 @@ class Apertus2KimiDeltaAttention(nn.Module):
             "state_v_first": True,
             "cu_seqlens": cu_seqlens,
         }
+        if self.a_log_per_channel:
+            kda_kwargs["g"] = self._activate_channel_decay(decay)
+            kda_kwargs["use_gate_in_kernel"] = False
+            del kda_kwargs["A_log"], kda_kwargs["dt_bias"]
         if use_cache and q_len == 1:
             core_out, recurrent_state = fused_recurrent_kda(query, key, value, **kda_kwargs)
         else:

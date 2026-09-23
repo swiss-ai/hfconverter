@@ -140,6 +140,7 @@ class _Geometry:
     linear_value_head_dim: int | None
     linear_conv_kernel_dim: int | None
     linear_attn_output_gate_bias: bool
+    linear_attn_a_log_per_channel: bool
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "_Geometry":
@@ -191,11 +192,11 @@ class _Geometry:
             linear_key_head_dim=config.get("linear_key_head_dim"),
             linear_value_head_dim=config.get("linear_value_head_dim"),
             linear_conv_kernel_dim=config.get("linear_conv_kernel_dim"),
-            # Absent means present, matching Apertus2Config's normalization (the fork always
-            # trains the output-gate bias); only an explicit False drops the bias row.
+            # Preserve older exports' biased layout; an explicit False drops the bias row.
             linear_attn_output_gate_bias=(
                 config.get("linear_attn_output_gate_bias") is not False
             ),
+            linear_attn_a_log_per_channel=bool(config.get("linear_attn_a_log_per_channel")),
         )
 
     @property
@@ -313,10 +314,8 @@ def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
     no fusion, split, or transpose. Hugging Face names follow the Kimi-Linear checkpoint
     spellings that vLLM's KDA loaders consume (q/k/v_proj, b_proj for beta, f_a/f_b_proj for
     the decay bottleneck, g_a/g_b_proj for the output-gate bottleneck, q/k/v_conv1d, A_log,
-    dt_bias, o_norm, o_proj), with one deviation: this fork's output gate trains a bias
-    (g_b_proj.bias), which Kimi-Linear does not. The bias row follows the config's
-    ``linear_attn_output_gate_bias`` (always True for this fork's exports — derive_config
-    pins it — so False only serves foreign, Kimi-Linear-style checkpoints). Both low-rank
+    dt_bias, o_norm, o_proj). Output-gate bias and per-channel A_log follow the config
+    fields inferred from checkpoint keys and shapes. Both low-rank
     bottlenecks are value_head_dim wide by KDA construction; dt_bias is per (value head x
     key channel), flattened.
     """
@@ -364,8 +363,9 @@ def _kda_attention_rows(layer_index: int, shape: _Geometry) -> list[Row]:
             (qk_dim, 1, kernel)),
         Row(f"{megatron}.conv1d.weight.value", (f"{hf}.v_conv1d.weight",), COPY,
             (value_dim, 1, kernel)),
-        # Decay parameters: one scalar per value head; bias per (value head x key channel).
-        Row(f"{megatron}.A_log", (f"{hf}.A_log",), COPY, (num_value_heads,)),
+        # Preserve every learned scale; channel-wise A_log must never be reduced to heads.
+        Row(f"{megatron}.A_log", (f"{hf}.A_log",), COPY,
+            (decay_dim if shape.linear_attn_a_log_per_channel else num_value_heads,)),
         Row(f"{megatron}.dt_bias", (f"{hf}.dt_bias",), COPY, (decay_dim,)),
         Row(f"{megatron}.decay_out_proj.weight", (f"{hf}.f_b_proj.weight",), COPY,
             (decay_dim, low_rank)),

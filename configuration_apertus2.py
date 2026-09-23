@@ -62,8 +62,10 @@ class Apertus2Config(PreTrainedConfig):
       ``g = g_min * sigmoid(exp(A_log) * (z + dt_bias))``, or ``None`` for the unbounded
       ``g = -exp(A_log) * softplus(z + dt_bias)``.  ``linear_attn_output_gate_bias`` declares
       whether the output gate's up-projection (``g_b_proj``) carries a trained bias — this
-      fork's exports always do, so an omitted field defaults to ``True`` on KDA models, while
-      Kimi-Linear-style checkpoints without the bias set ``False``.  KDA layers ignore RoPE and
+      older exports used a bias, so an omitted field defaults to ``True`` on KDA models,
+      while checkpoints without it set ``False``. ``linear_attn_a_log_per_channel``
+      selects one decay scale per key channel instead of per head (default ``False``).
+      KDA layers ignore RoPE and
       ``attention_output_gate`` (they carry their own sigmoid gate), and cannot be mixed with
       sliding-window layers in one model.
     - ``no_rope_layers`` marks each layer ``1`` (rotate) or ``0`` (NoPE).  The polarity follows
@@ -134,12 +136,11 @@ class Apertus2Config(PreTrainedConfig):
     no_rope_layers: list[int] | None = None
     # KDA (Kimi Delta Attention) geometry, active on the layers whose layer_types entry is
     # "linear_attention".  Field names follow Qwen3-Next; gate_lower_bound is the Kimi-K3 knob
-    # vLLM consumes.  All seven stay None on a pure-softmax model.  The low-rank bottleneck
+    # vLLM consumes. These stay None on a pure-softmax model. The low-rank bottleneck
     # width of the decay and output-gate projections is not a field: it equals
     # linear_value_head_dim by KDA construction.  linear_attn_output_gate_bias declares whether
     # g_b_proj carries a trained bias; on KDA models an absent field normalizes to True (this
-    # fork always trains the bias), while Kimi-Linear-style checkpoints without one must say
-    # False explicitly.
+    # historical layout), while checkpoints without one must say False explicitly.
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
     linear_key_head_dim: int | None = None
@@ -147,6 +148,9 @@ class Apertus2Config(PreTrainedConfig):
     linear_conv_kernel_dim: int | None = None
     gate_lower_bound: float | None = None
     linear_attn_output_gate_bias: bool | None = None
+    # Megatron's KDA_ALOG_PER_CHANNEL environment flag is not stored in args. The exporter
+    # infers this from A_log's tensor shape; old exports retain their per-head layout.
+    linear_attn_a_log_per_channel: bool | None = None
     moe_intermediate_size: int = 448
     num_experts_per_tok: int = 4
     n_shared_experts: int = 1
@@ -340,6 +344,8 @@ class Apertus2Config(PreTrainedConfig):
                 stray["gate_lower_bound"] = self.gate_lower_bound
             if self.linear_attn_output_gate_bias is not None:
                 stray["linear_attn_output_gate_bias"] = self.linear_attn_output_gate_bias
+            if self.linear_attn_a_log_per_channel is not None:
+                stray["linear_attn_a_log_per_channel"] = self.linear_attn_a_log_per_channel
             if stray:
                 raise ValueError(
                     "KDA fields are set but no layer_types entry is 'linear_attention'; the "
@@ -375,11 +381,13 @@ class Apertus2Config(PreTrainedConfig):
                 "[-5, 0) (the bounded Kimi-K3 gate; FlashKDA and vLLM assert the same range); "
                 f"got {self.gate_lower_bound!r}"
             )
-        # The fork always trains the output-gate bias, so an omitted field means "present";
-        # only a checkpoint that genuinely lacks g_b_proj.bias (upstream Kimi-Linear style)
-        # sets False, and the modeling code then builds the projection without one.
+        # Preserve old exports' biased layout. New exports infer presence from tensor keys.
         if self.linear_attn_output_gate_bias is None:
             self.linear_attn_output_gate_bias = True
+        if self.linear_attn_a_log_per_channel is None:
+            self.linear_attn_a_log_per_channel = False
+        if not isinstance(self.linear_attn_a_log_per_channel, bool):
+            raise ValueError("linear_attn_a_log_per_channel must be a boolean")
 
     def _set_full_rotary_defaults(self, kwargs: dict) -> None:
         """Configure RoPE over the entire attention head, never an accidental half-head."""

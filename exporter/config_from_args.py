@@ -578,13 +578,10 @@ def _derive_linear_attention(
         f"linear_value_head_dim = {geometry['linear_value_head_dim']} (derived by KDA "
         "construction, not an independent arg)"
     )
-    support.passed.append(
-        "this fork's gate_out_proj always trains a bias -> linear_attn_output_gate_bias = "
-        "True (g_b_proj.bias is exported; upstream Kimi-Linear checkpoints have none)"
-    )
     return {
         **geometry,
         "gate_lower_bound": gate_lower_bound,
+        # Historical default for args-only callers. Real exports resolve this from metadata.
         "linear_attn_output_gate_bias": True,
     }
 
@@ -855,8 +852,10 @@ def derive_config(
     args: Namespace,
     *,
     moe_router_quantile_balancing_method: str | None = None,
+    checkpoint_keys: set[str] | None = None,
+    checkpoint_shapes: dict[str, tuple[int, ...]] | None = None,
 ) -> DerivedConfig:
-    """Validate checkpoint support and derive the Hugging Face configuration."""
+    """Derive config, resolving KDA environment-only options from checkpoint metadata."""
     support = _SupportBoundary()
     num_layers = _req(args, "num_layers")
     hidden_act = _validate_base_architecture(args, support)
@@ -865,6 +864,57 @@ def derive_config(
     no_rope_layers = _derive_no_rope_layers(args, support, num_layers)
     sliding_window, layer_types = _derive_attention_window(args, support, num_layers)
     linear_attention_kwargs = _derive_linear_attention(args, support, num_layers, layer_types)
+    kda_layers = [i for i, kind in enumerate(layer_types) if kind == "linear_attention"]
+    if kda_layers:
+        per_channel = False
+        if checkpoint_shapes is None:
+            support.passed.append(
+                "KDA A_log shapes unavailable; historical args-only default "
+                "linear_attn_a_log_per_channel = False (unverified)"
+            )
+        else:
+            heads = linear_attention_kwargs["linear_num_value_heads"]
+            channels = heads * linear_attention_kwargs["linear_key_head_dim"]
+            layouts = set()
+            for i in kda_layers:
+                key = f"decoder.layers.{i}.self_attention.A_log"
+                shape = checkpoint_shapes.get(key)
+                if shape not in ((heads,), (channels,)):
+                    raise ValueError(
+                        f"{key}: expected per-head {(heads,)} or per-channel "
+                        f"{(channels,)} A_log, got {shape}"
+                    )
+                layouts.add(shape)
+            if len(layouts) != 1:
+                raise ValueError("mixed KDA A_log layouts; all KDA layers must agree")
+            per_channel = layouts == {(channels,)} and channels != heads
+            support.passed.append(
+                f"checkpoint A_log shape {next(iter(layouts))} on {len(kda_layers)} "
+                f"KDA layers -> linear_attn_a_log_per_channel = {per_channel}"
+            )
+        linear_attention_kwargs["linear_attn_a_log_per_channel"] = per_channel
+        if checkpoint_keys is None:
+            support.passed.append(
+                "KDA output-gate bias: checkpoint keys unavailable; historical args-only "
+                "default linear_attn_output_gate_bias = True (unverified)"
+            )
+        else:
+            biased_layers = [i for i in kda_layers
+                             if f"decoder.layers.{i}.self_attention.gate_out_proj.bias"
+                             in checkpoint_keys]
+            if biased_layers and len(biased_layers) != len(kda_layers):
+                missing = sorted(set(kda_layers) - set(biased_layers))
+                raise ValueError(
+                    "mixed KDA output-gate bias presence: bias exists on layers "
+                    f"{biased_layers} but is absent on layers {missing}; "
+                    "the HF config requires one uniform setting"
+                )
+            has_bias = bool(biased_layers)
+            linear_attention_kwargs["linear_attn_output_gate_bias"] = has_bias
+            support.passed.append(
+                f"checkpoint gate_out_proj.bias present on {len(biased_layers)}/"
+                f"{len(kda_layers)} KDA layers -> linear_attn_output_gate_bias = {has_bias}"
+            )
     _validate_residual_scheme(args, support)
     _validate_router_and_attention(args, support)
     offloaded_experts = _derive_expert_storage(args, support)

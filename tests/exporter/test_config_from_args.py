@@ -19,8 +19,6 @@ import math
 
 import pytest
 
-pytest.importorskip("megatron.core")
-
 import exporter.config_from_args as config_from_args_module  # noqa: E402
 
 import megatron_mock  # noqa: E402
@@ -744,14 +742,57 @@ class TestLinearAttentionDerivation:
         assert config.linear_value_head_dim == 8
         assert config.linear_conv_kernel_dim == 4
         assert config.gate_lower_bound == -5.0
-        # The fork's gate_out_proj always trains a bias, so the derivation pins the field
-        # explicitly rather than leaning on the config default.
+        # Args-only callers retain the historical default; exports inspect tensor keys.
         assert config.linear_attn_output_gate_bias is True
+
+    @pytest.mark.parametrize("has_bias", [True, False])
+    def test_kda_output_gate_bias_is_derived_from_checkpoint_keys(self, has_bias):
+        keys = {f"decoder.layers.{i}.self_attention.gate_out_proj.bias" for i in (0, 1)}
+        kwargs, _, result = derive(kda_args(), checkpoint_keys=keys if has_bias else set())
+        assert kwargs["linear_attn_output_gate_bias"] is has_bias
+        assert any(f"linear_attn_output_gate_bias = {has_bias}" in c for c in result.checks)
+
+    def test_partial_kda_output_gate_bias_is_rejected(self):
+        with pytest.raises(ValueError, match="mixed KDA output-gate bias presence"):
+            derive(kda_args(), checkpoint_keys={
+                "decoder.layers.0.self_attention.gate_out_proj.bias",
+            })
+
+    def test_non_kda_and_optimizer_bias_keys_do_not_enable_kda_bias(self):
+        kwargs, _, _ = derive(kda_args(), checkpoint_keys={
+            "decoder.layers.2.self_attention.gate_out_proj.bias",
+            "optimizer.decoder.layers.0.self_attention.gate_out_proj.bias",
+        })
+        assert kwargs["linear_attn_output_gate_bias"] is False
 
     def test_unsafe_gate_exports_a_none_lower_bound(self):
         # gate_lower_bound=None must mean "softplus decay gate", not "default to -5".
         config = derive_config(kda_args(linear_attention_safe_output_gate=False))
         assert config.gate_lower_bound is None
+
+    @pytest.mark.parametrize("per_channel", [False, True])
+    def test_kda_a_log_layout_is_derived_from_shapes(self, per_channel):
+        shapes = {f"decoder.layers.{i}.self_attention.A_log":
+                  (16 if per_channel else 2,) for i in (0, 1)}
+        kwargs, _, result = derive(kda_args(), checkpoint_shapes=shapes)
+        assert kwargs["linear_attn_a_log_per_channel"] is per_channel
+        assert any("checkpoint A_log shape" in c for c in result.checks)
+
+    @pytest.mark.parametrize("shape", [None, (3,), (2, 8), (1, 1, 2, 1)])
+    def test_unknown_or_missing_a_log_shape_is_rejected(self, shape):
+        shapes = {} if shape is None else {"decoder.layers.0.self_attention.A_log": shape}
+        with pytest.raises(ValueError, match="expected per-head"):
+            derive(kda_args(), checkpoint_shapes=shapes)
+
+    def test_mixed_a_log_layout_is_rejected(self):
+        with pytest.raises(ValueError, match="mixed KDA A_log layouts"):
+            derive(kda_args(), checkpoint_shapes={
+                "decoder.layers.0.self_attention.A_log": (2,),
+                "decoder.layers.1.self_attention.A_log": (16,),
+            })
+
+    def test_args_only_keeps_legacy_a_log_default(self):
+        assert derive_config(kda_args()).linear_attn_a_log_per_channel is False
 
     def test_int_freq_makes_every_nth_layer_softmax(self):
         # The fork expands int N to softmax where 1-indexed layer % N == 0, KDA elsewhere.

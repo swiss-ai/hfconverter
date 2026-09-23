@@ -155,9 +155,12 @@ def _prepare_export(
 ) -> _PreparedExport:
     """Stages 1-2: inspect Megatron metadata and plan every Hugging Face output tensor."""
     checkpoint_args, common_state = reader.load_args(checkpoint_dir)
+    metadata = reader.load_metadata(checkpoint_dir)
     derived = config_from_args.derive_config(
         checkpoint_args,
         moe_router_quantile_balancing_method=moe_router_quantile_balancing_method,
+        checkpoint_keys=set(metadata),
+        checkpoint_shapes={key: tuple(value.global_shape) for key, value in metadata.items()},
     )
     checks = list(derived.checks)
     logger.info(
@@ -168,7 +171,6 @@ def _prepare_export(
         derived.kwargs["n_routed_experts"],
     )
 
-    metadata = reader.load_metadata(checkpoint_dir)
     model_keys, dropped_keys = mapping.partition_universe(set(metadata), strict_optimizer)
     mapping.assert_no_unsupported(model_keys, derived.offloaded_experts)
 
