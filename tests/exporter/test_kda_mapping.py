@@ -77,9 +77,8 @@ class TestKdaPlan:
         assert {key for row in kda_rows for key in row.hf_keys} == set(expected_hf)
 
     def test_output_gate_bias_row_follows_the_config_field(self):
-        # derive_config pins linear_attn_output_gate_bias=True for this fork (gate_out_proj
-        # always trains a bias); an explicit False must drop exactly the bias row on every
-        # KDA layer so a Kimi-Linear-style checkpoint without the key still bijects.
+        # Args-only derivation preserves the historical True default. An explicit False
+        # must drop exactly the bias row on every KDA layer.
         _, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
         derived = config_from_args.derive_config(args)
         assert derived.kwargs["linear_attn_output_gate_bias"] is True
@@ -134,8 +133,25 @@ class TestKdaConvert:
 
 
 class TestKdaExportEndToEnd:
-    def test_export_writes_kda_weights_and_config(self, dist_env, export_api, tmp_path):
+    @pytest.mark.parametrize("has_bias", [True, False])
+    @pytest.mark.parametrize("per_channel", [True, False])
+    def test_export_writes_kda_weights_and_config(
+        self, dist_env, export_api, tmp_path, has_bias, per_channel
+    ):
         tensors, args, expected_hf, _ = megatron_mock.build_tiny_kda_checkpoint()
+        if per_channel:
+            for layer, is_kda in enumerate(megatron_mock.TINY_KDA_PATTERN):
+                if is_kda:
+                    # Distinct channel values catch accidental slicing or averaging.
+                    weight = torch.arange(
+                        megatron_mock.TINY_KDA_HEADS * megatron_mock.TINY_KDA_HEAD_DIM,
+                        dtype=tensors[f"decoder.layers.{layer}.self_attention.A_log"].dtype,
+                    ) / 16
+                    tensors[f"decoder.layers.{layer}.self_attention.A_log"] = weight
+                    expected_hf[f"model.layers.{layer}.self_attn.A_log"] = weight
+        if not has_bias:
+            tensors = {k: v for k, v in tensors.items() if not k.endswith("gate_out_proj.bias")}
+            expected_hf = {k: v for k, v in expected_hf.items() if not k.endswith("g_b_proj.bias")}
         checkpoint_dir = tmp_path / "ckpt"
         megatron_mock.save_synthetic_checkpoint(tensors, args, checkpoint_dir)
         output_dir = tmp_path / "out"
@@ -152,6 +168,8 @@ class TestKdaExportEndToEnd:
         assert config["linear_value_head_dim"] == megatron_mock.TINY_KDA_HEAD_DIM
         assert config["linear_conv_kernel_dim"] == megatron_mock.TINY_KDA_CONV_KERNEL
         assert config["gate_lower_bound"] == -5.0
+        assert config["linear_attn_output_gate_bias"] is has_bias
+        assert config["linear_attn_a_log_per_channel"] is per_channel
         # vLLM's hybrid class; the HF side still loads through the unchanged auto_map.
         assert config["architectures"] == ["Apertus2KDAForCausalLM"]
         assert config["auto_map"]["AutoModelForCausalLM"] == (
@@ -159,12 +177,26 @@ class TestKdaExportEndToEnd:
         )
 
         written = load_file(str(output_dir / "model.safetensors"))
+        assert any(k.endswith("g_b_proj.bias") for k in written) is has_bias
         for hf_key, reference in expected_hf.items():
             assert hf_key in written, hf_key
             assert torch.equal(written[hf_key], reference), hf_key
 
+    def test_partial_output_gate_bias_fails_before_writing_weights(
+        self, dist_env, export_expect_failure, tmp_path
+    ):
+        tensors, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
+        del tensors["decoder.layers.0.self_attention.gate_out_proj.bias"]
+        checkpoint_dir = tmp_path / "ckpt"
+        megatron_mock.save_synthetic_checkpoint(tensors, args, checkpoint_dir)
+        output_dir = tmp_path / "out"
+        error = export_expect_failure(checkpoint_dir, output_dir)
+        assert "mixed KDA output-gate bias presence" in error
+        assert not list(output_dir.glob("*.safetensors"))
+
+    @pytest.mark.parametrize("per_channel", [False, True])
     def test_verify_load_requires_flash_linear_attention(
-        self, dist_env, export_api, export_expect_failure, tmp_path
+        self, dist_env, export_api, export_expect_failure, tmp_path, per_channel
     ):
         # --verify-load builds the HF model, whose KDA layers run on flash-linear-attention:
         # with the package installed the exported dir must load back cleanly, and without it
@@ -174,6 +206,10 @@ class TestKdaExportEndToEnd:
         from modeling_apertus2 import chunk_kda
 
         tensors, args, _, _ = megatron_mock.build_tiny_kda_checkpoint()
+        if per_channel:
+            for key, value in list(tensors.items()):
+                if key.endswith(".A_log"):
+                    tensors[key] = value.repeat_interleave(megatron_mock.TINY_KDA_HEAD_DIM)
         checkpoint_dir = tmp_path / "ckpt"
         megatron_mock.save_synthetic_checkpoint(tensors, args, checkpoint_dir)
         if chunk_kda is None:

@@ -30,6 +30,10 @@ if [ "$VLLM_REF" = WORKTREE ]; then DIFF_RANGE="$BASE_TAG"; else DIFF_RANGE="$BA
 echo "overlay  : git diff $DIFF_RANGE"
 git -C "$VLLM_CHECKOUT" diff "$DIFF_RANGE" -- \
     vllm/model_executor/models/apertus2.py \
+    vllm/models/kimi_k3/nvidia/ops/third_party/kda/chunk.py \
+    vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py \
+    vllm/models/kimi_k3/amd/ops/third_party/kda/chunk.py \
+    vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py \
     vllm/model_executor/models/registry.py \
     vllm/config/compilation.py \
     vllm/model_executor/layers/activation.py \

@@ -50,6 +50,33 @@ Splits and transposes change tensor layout but not values. Every source model
 key must be consumed exactly once and every expected Hugging Face key must be
 produced exactly once.
 
+For KDA layers, `linear_attn_output_gate_bias` is derived from checkpoint tensor
+metadata: `gate_out_proj.bias` on every KDA layer enables the bias; absence on
+every KDA layer disables it. Mixed presence is rejected because the HF config
+has one model-wide setting. Present biases retain their values and undergo the
+usual shape/dtype and bitwise checks; absent biases are not synthesized. The
+decision is recorded in `conversion_info.json`. Args-only configuration helpers
+retain the historical biased default, but actual exports always provide metadata.
+
+`linear_attn_a_log_per_channel` is likewise inferred from every KDA layer's
+`A_log` shape: `(linear_num_value_heads,)` means one scale per head; the flattened
+`(linear_num_value_heads * linear_key_head_dim,)` layout means a separate scale
+for each key channel. Mixed, missing, and unexpected layouts are rejected. No
+averaging, slicing, or repetition is performed: the source values and dtype are
+preserved bit-for-bit. Old configs that omit the field retain per-head behavior.
+
+This layout was introduced by Megatron commit
+[`0d2c35880`](https://github.com/swiss-ai/Megatron-LM-MoE/commit/0d2c35880d46a0941ba28f2eb10a8259f3888c80)
+(September 8, 2026), controlled by `KDA_ALOG_PER_CHANNEL=1`, an environment variable
+not recorded in checkpoint args. Commit `93ed5b3c2` subsequently enabled compatible
+FLA fused gates. For a bounded gate the formula is
+`g[h,k] = lower_bound * sigmoid(exp(A_log[h,k]) * (alpha[h,k] + dt_bias[h,k]))`;
+without a lower bound it is `-exp(A_log[h,k]) * softplus(alpha[h,k] + dt_bias[h,k])`.
+HF computes per-channel decay explicitly in FP32 and feeds the activated decay
+to FLA for both prefill and cached decode. The vLLM port indexes scales per channel
+in its Triton prefill, decode, and speculative-decode kernels; older per-head
+checkpoints retain their fused path. This does not change recurrent-state size.
+
 ## Dtypes and losslessness
 
 The exporter does not cast model parameters. It requires one consistent source

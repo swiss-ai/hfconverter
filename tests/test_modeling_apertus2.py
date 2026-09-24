@@ -3,9 +3,11 @@
 import glob
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
+from huggingface_hub.errors import StrictDataclassFieldValidationError
 from safetensors import safe_open
 
 from transformers import AutoModelForCausalLM, Glm4MoeConfig, Glm4MoeForCausalLM
@@ -44,6 +46,73 @@ from conftest import (
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+def test_channel_decay_matches_megatron_and_preserves_channel_gradients(lower_bound):
+    """The environment-only Megatron option changes the scale, not beta or output gating."""
+    heads, dim = 2, 8
+    raw = torch.randn(1, 5, heads, dim, dtype=torch.bfloat16, requires_grad=True)
+    a_log = torch.linspace(-1, 1, heads * dim, requires_grad=True)
+    bias = torch.randn(heads * dim, requires_grad=True)
+    layer = SimpleNamespace(
+        A_log=a_log, dt_bias=bias, num_heads=heads, head_k_dim=dim,
+        gate_lower_bound=lower_bound,
+    )
+    actual = modeling_apertus2.Apertus2KimiDeltaAttention._activate_channel_decay(layer, raw)
+    expected = torch.empty_like(raw, dtype=torch.float32)
+    for h in range(heads):
+        for k in range(dim):
+            i = h * dim + k
+            x = raw[..., h, k].float() + bias[i]
+            expected[..., h, k] = (
+                lower_bound * torch.sigmoid(a_log[i].exp() * x)
+                if lower_bound is not None else -a_log[i].exp() * torch.nn.functional.softplus(x)
+            )
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    assert a_log.grad is not None and torch.count_nonzero(a_log.grad) == heads * dim
+    assert bias.grad is not None and torch.count_nonzero(bias.grad) == heads * dim
+    assert raw.grad is not None and torch.isfinite(raw.grad).all()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or modeling_apertus2.chunk_kda is None,
+    reason="KDA inference requires CUDA and flash-linear-attention",
+)
+@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@torch.inference_mode()
+def test_kda_channel_prefill_and_cached_decode(make_config, lower_bound):
+    """Expanded scalar weights agree with the fused legacy path; real channels cache correctly."""
+    options = dict(
+        num_hidden_layers=2, layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=2, linear_num_value_heads=2,
+        linear_key_head_dim=64, linear_value_head_dim=64,
+        linear_conv_kernel_dim=4, gate_lower_bound=lower_bound,
+    )
+    legacy = Apertus2ForCausalLM(make_config(**options)).cuda().bfloat16().eval()
+    channel = Apertus2ForCausalLM(make_config(
+        **options, linear_attn_a_log_per_channel=True,
+    )).cuda().bfloat16().eval()
+    attn = legacy.model.layers[0].self_attn
+    attn.A_log = torch.nn.Parameter(torch.tensor([-0.5, 0.5], device="cuda"))
+    attn.dt_bias = torch.nn.Parameter(attn.dt_bias.float())
+    state = legacy.state_dict()
+    state["model.layers.0.self_attn.A_log"] = attn.A_log.repeat_interleave(64)
+    channel.load_state_dict(state, assign=True)
+    tokens = torch.randint(0, legacy.config.vocab_size, (1, 17), device="cuda")
+    left = legacy(tokens[:, :-1], use_cache=True)
+    right = channel(tokens[:, :-1], use_cache=True)
+    torch.testing.assert_close(left.logits, right.logits, rtol=0.02, atol=0.01)
+    left_next = legacy(tokens[:, -1:], past_key_values=left.past_key_values, use_cache=True)
+    right_next = channel(tokens[:, -1:], past_key_values=right.past_key_values, use_cache=True)
+    torch.testing.assert_close(left_next.logits, right_next.logits, rtol=0.02, atol=0.01)
+
+    # Distinct channel scales exercise the actual new architecture, not just repetition.
+    channel.model.layers[0].self_attn.A_log.copy_(torch.linspace(-1, 1, 128, device="cuda"))
+    full = channel(tokens, use_cache=False).logits[:, -1:]
+    prefill = channel(tokens[:, :-1], use_cache=True)
+    decoded = channel(tokens[:, -1:], past_key_values=prefill.past_key_values, use_cache=True)
+    torch.testing.assert_close(full, decoded.logits, rtol=0.02, atol=0.01)
 
 
 def _as_tensor(out):
@@ -337,7 +406,8 @@ class TestTensorParallelUnsupported:
 
 
 class TestConfigValidation:
-    def test_kda_layers_never_degrade_to_softmax_attention(self, make_config):
+    @pytest.mark.parametrize("per_channel", [False, True])
+    def test_kda_layers_never_degrade_to_softmax_attention(self, make_config, per_channel):
         # A valid KDA config must never silently build softmax attention around KDA weights:
         # with flash-linear-attention installed the layer builds the KDA module, without it
         # model construction fails loudly. The branch condition is the environment itself, so
@@ -350,6 +420,7 @@ class TestConfigValidation:
             linear_value_head_dim=8,
             linear_conv_kernel_dim=4,
             gate_lower_bound=-5.0,
+            linear_attn_a_log_per_channel=per_channel,
         )
         if modeling_apertus2.chunk_kda is None:
             with pytest.raises(ImportError, match="flash-linear-attention"):
@@ -361,6 +432,9 @@ class TestConfigValidation:
             assert not isinstance(model.model.layers[1].self_attn, kda)
             # The fork trains the output-gate bias; the normalized config default builds it.
             assert model.model.layers[0].self_attn.g_b_proj.bias is not None
+            assert model.model.layers[0].self_attn.A_log.shape == (
+                16 if per_channel else 2,
+            )
 
     def test_output_gate_bias_field_defaults_to_true_only_on_kda_configs(self, make_config):
         # Omitted on a KDA config, the field normalizes to True (this fork always trains
@@ -377,6 +451,14 @@ class TestConfigValidation:
         assert make_config(**kda_kwargs).linear_attn_output_gate_bias is True
         no_bias = make_config(**kda_kwargs, linear_attn_output_gate_bias=False)
         assert no_bias.linear_attn_output_gate_bias is False
+        assert no_bias.linear_attn_a_log_per_channel is False
+        with pytest.raises((ValueError, StrictDataclassFieldValidationError),
+                           match="linear_attn_a_log_per_channel"):
+            make_config(**kda_kwargs, linear_attn_a_log_per_channel="true")
+
+    def test_stray_a_log_layout_rejected_without_kda(self, make_config):
+        with pytest.raises(ValueError, match="linear_attn_a_log_per_channel"):
+            make_config(linear_attn_a_log_per_channel=True)
 
     def test_stray_output_gate_bias_field_rejected_without_kda_layers(self, make_config):
         # Like the geometry fields: set without a 'linear_attention' layer it describes a
