@@ -21,10 +21,10 @@ import megatron_mock  # noqa: E402
 from exporter import mapping, output_claim, reader, writer  # noqa: E402
 from exporter.export import export_checkpoint  # noqa: E402
 
-FP32_BUFFER_SUFFIXES = ("e_score_correction_bias", "qb_beta")
+FP32_BUFFER_SUFFIXES = ("qb_beta",)
 
 
-def _save_ckpt(tmp_path, *, dtype=torch.float32, expert_bias=True, extra_tensors=None):
+def _save_ckpt(tmp_path, *, dtype=torch.float32, expert_bias=False, extra_tensors=None):
     model = megatron_mock.build_tiny_model(
         sandwich_norm=True, moe_latent_size=None, use_quantile_balancing=True, seed=3
     )
@@ -82,8 +82,8 @@ class TestBf16Export:
         )
 
     def test_mixed_parameter_dtypes_fail_before_shard_planning(self):
-        config = megatron_mock.tiny_export_config(False, None, False)
-        plan = mapping.build_plan(config.to_dict(), expert_bias_present=True)
+        config = megatron_mock.tiny_export_config(False, None, True)
+        plan = mapping.build_plan(config.to_dict(), expert_bias_present=False)
         metadata = {
             row.megatron_key: SimpleNamespace(
                 global_shape=row.shape,
@@ -99,30 +99,27 @@ class TestBf16Export:
 
 
 class TestGroupLimitedExport:
-    def test_group_geometry_reaches_saved_hf_config(self, dist_env, export_api, tmp_path):
+    def test_group_routing_is_rejected_before_export(self, dist_env, export_expect_failure, tmp_path):
         model = megatron_mock.build_tiny_model(
             sandwich_norm=False,
             moe_latent_size=None,
-            use_quantile_balancing=False,
+            use_quantile_balancing=True,
             seed=3,
-            n_group=3,
-            topk_group=1,
         )
         tensors = megatron_mock.to_megatron_tensors(
-            model, model.config, expert_bias_present=True
+            model, model.config, expert_bias_present=False
         )
         args = megatron_mock.make_args_namespace(
-            model.config, expert_bias_present=True
+            model.config, expert_bias_present=False,
+            moe_router_num_groups=3, moe_router_group_topk=1,
         )
         ckpt = tmp_path / "iter_0000100"
         megatron_mock.save_synthetic_checkpoint(tensors, args, ckpt, iteration=100)
 
         out_dir = tmp_path / "hf"
-        export_api(ckpt, out_dir)
-
-        saved_config = json.loads((out_dir / "config.json").read_text())
-        assert saved_config["n_group"] == 3
-        assert saved_config["topk_group"] == 1
+        message = export_expect_failure(ckpt, out_dir)
+        assert "quantile balancing" in message
+        assert not (out_dir / "model.safetensors").exists()
 
 
 class TestSharding:

@@ -22,7 +22,7 @@ import megatron_mock  # noqa: E402
 from exporter import config_from_args, mapping  # noqa: E402
 
 
-def _plan_and_fixture(expert_bias=True, seed=0):
+def _plan_and_fixture(expert_bias=False, seed=0):
     tensors, args, expected_hf, donor = megatron_mock.build_tiny_kda_checkpoint(
         seed=seed, expert_bias_present=expert_bias
     )

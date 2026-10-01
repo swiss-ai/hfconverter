@@ -82,7 +82,7 @@ def make_export_config():
     """Factory for tiny Apertus2Config over the {sandwich} x {latent} x {QB} matrix."""
 
     def _make(
-        sandwich_norm=False, moe_latent_size=None, use_quantile_balancing=False, **overrides
+        sandwich_norm=False, moe_latent_size=None, use_quantile_balancing=True, **overrides
     ):
         return megatron_mock.tiny_export_config(
             sandwich_norm, moe_latent_size, use_quantile_balancing, **overrides
@@ -99,7 +99,7 @@ def make_export_model():
     def _make(
         sandwich_norm=False,
         moe_latent_size=None,
-        use_quantile_balancing=False,
+        use_quantile_balancing=True,
         seed=0,
         **kwargs,
     ):

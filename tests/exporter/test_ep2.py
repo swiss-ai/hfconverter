@@ -46,9 +46,9 @@ def _read_all_safetensors(directory):
 @pytest.mark.skipif(not torchrun_available, reason="torch.distributed.run unavailable")
 def test_ep2_expert_axis_sharded_save_exports_bitwise(dist_env, export_api, tmp_path):
     # one payload, shared bit-identically by the 2-rank save and the reference save
-    model = megatron_mock.build_tiny_model(False, None, False, seed=0)
-    tensors = megatron_mock.to_megatron_tensors(model, model.config, expert_bias_present=True)
-    args = megatron_mock.make_args_namespace(model.config, expert_bias_present=True)
+    model = megatron_mock.build_tiny_model(False, None, True, seed=0)
+    tensors = megatron_mock.to_megatron_tensors(model, model.config, expert_bias_present=False)
+    args = megatron_mock.make_args_namespace(model.config, expert_bias_present=False)
     payload_path = tmp_path / "payload.pt"
     torch.save({"tensors": tensors, "args": args, "iteration": 100}, payload_path)
 

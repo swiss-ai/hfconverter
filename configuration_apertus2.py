@@ -39,8 +39,8 @@ class Apertus2Config(PreTrainedConfig):
       ``x + residual_multiplier * post_norm(branch(pre_norm(x)))``.
     - ``moe_latent_size`` makes routed experts work in a smaller feature space.  The router and
       shared expert still see the full ``hidden_size`` representation.
-    - ``use_quantile_balancing`` subtracts ``qb_beta`` before expert selection.  The
-      ``moe_router_quantile_balancing_method`` chooses its score space: ``sigmoid`` (the
+    - Routing requires ``use_quantile_balancing=True`` and subtracts ``qb_beta`` before expert
+      selection. ``moe_router_quantile_balancing_method`` chooses its score space: ``sigmoid`` (the
       default) selects from sigmoid router scores, ``legacy`` from raw router logits.
       Megatron's training-time estimator names are accepted and normalized on load
       (``average``/``histogram`` -> ``sigmoid``, ``legacy_average`` -> ``legacy``).  QB
@@ -163,7 +163,8 @@ class Apertus2Config(PreTrainedConfig):
     norm_topk_prob: bool = True
     sandwich_norm: bool = False
     moe_latent_size: int | None = None
-    use_quantile_balancing: bool = False
+    use_quantile_balancing: bool = True
+    moe_router_enable_expert_bias: bool = False
     # Score space for QB expert selection; "legacy" keeps the raw-logit selection of the earliest
     # QB exports.  Exports from that era bundle their own modeling code, so the modern sigmoid
     # space is the default here; loading such an old field-less config.json with THIS code
@@ -204,25 +205,28 @@ class Apertus2Config(PreTrainedConfig):
 
     def _validate_router_options(self) -> None:
         """Ensure Hugging Face routing performs the same math as the Megatron model."""
-        if self.use_quantile_balancing:
-            # Megatron names its training-time quantile estimators; inference only needs the
-            # selection score space, so the estimator names collapse onto the canonical pair.
-            aliases = {
-                "average": "sigmoid",
-                "histogram": "sigmoid",
-                "legacy_average": "legacy",
-            }
-            method = aliases.get(
-                self.moe_router_quantile_balancing_method,
-                self.moe_router_quantile_balancing_method,
+        if self.use_quantile_balancing is not True:
+            raise ValueError("Apertus2 supports only quantile balancing; use_quantile_balancing must be True.")
+        if self.moe_router_enable_expert_bias:
+            raise ValueError("Apertus2 QB-only models require moe_router_enable_expert_bias=False.")
+        # Megatron names its training-time quantile estimators; inference only needs the
+        # selection score space, so the estimator names collapse onto the canonical pair.
+        aliases = {
+            "average": "sigmoid",
+            "histogram": "sigmoid",
+            "legacy_average": "legacy",
+        }
+        method = aliases.get(
+            self.moe_router_quantile_balancing_method,
+            self.moe_router_quantile_balancing_method,
+        )
+        if method not in ("sigmoid", "legacy"):
+            raise ValueError(
+                "moe_router_quantile_balancing_method must be 'sigmoid' or 'legacy' "
+                "(Megatron spellings 'average', 'histogram', and 'legacy_average' are also "
+                f"accepted); got {self.moe_router_quantile_balancing_method!r}."
             )
-            if method not in ("sigmoid", "legacy"):
-                raise ValueError(
-                    "moe_router_quantile_balancing_method must be 'sigmoid' or 'legacy' "
-                    "(Megatron spellings 'average', 'histogram', and 'legacy_average' are also "
-                    f"accepted); got {self.moe_router_quantile_balancing_method!r}."
-                )
-            self.moe_router_quantile_balancing_method = method
+        self.moe_router_quantile_balancing_method = method
         # Megatron normalizes selected weights exactly when more than one expert is selected.
         if self.num_experts_per_tok == 1 and self.norm_topk_prob:
             raise ValueError(
@@ -236,12 +240,30 @@ class Apertus2Config(PreTrainedConfig):
                 "fork always renormalizes top-k weights when topk>1. Set norm_topk_prob=True for "
                 "topk>1."
             )
-        if self.use_quantile_balancing and (self.n_group != 1 or self.topk_group != 1):
+        if self.n_group != 1 or self.topk_group != 1:
             raise ValueError(
                 f"use_quantile_balancing=True is incompatible with group-limited routing "
                 f"(got n_group={self.n_group}, topk_group={self.topk_group}); the Megatron fork "
                 "forbids QB with num_groups/group_topk set. Use n_group=1 and topk_group=1."
             )
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        """Require saved checkpoints to declare QB instead of reinterpreting old routing."""
+        if config_dict.get("use_quantile_balancing") is not True:
+            raise ValueError("Apertus2 checkpoints must explicitly declare use_quantile_balancing=True.")
+        result = super().from_dict(config_dict, **kwargs)
+        # Transformers applies keyword overrides after constructing the config, so validate
+        # routing again after those overrides (including when returning unused keywords).
+        config = result[0] if isinstance(result, tuple) else result
+        config._validate_router_options()
+        return result
+
+    def to_diff_dict(self):
+        """Keep the routing declaration even though QB is the constructor default."""
+        result = super().to_diff_dict()
+        result["use_quantile_balancing"] = True
+        return result
 
     def _set_mlp_schedule(self) -> None:
         """Validate dense/MoE placement while preserving legacy cutoff-only configs.

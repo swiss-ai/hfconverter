@@ -687,74 +687,17 @@ def _validate_router_and_attention(args: Namespace, support: _SupportBoundary) -
     )
 
 
-def _derive_group_limits(
-    args: Namespace,
-    support: _SupportBoundary,
-    *,
-    expert_count: int,
-    topk: int,
-    use_quantile_balancing: bool,
-) -> tuple[int, int]:
-    """Translate Megatron's optional group-limited routing settings.
-
-    Megatron enables this path only when ``moe_router_group_topk`` is truthy. A group count by
-    itself therefore has no effect and is normalized to HF's ordinary-routing values ``(1, 1)``.
-    When the path is active, the HF router implements the same contiguous expert groups and the
-    same ``topk // group_topk`` group score.
-    """
+def _derive_group_limits(args: Namespace, support: _SupportBoundary) -> tuple[int, int]:
+    """QB uses unrestricted top-k; reject every Megatron group-routing setting."""
     router_groups = _req(args, "moe_router_num_groups")
     group_topk = _req(args, "moe_router_group_topk")
-    if use_quantile_balancing:
-        support.require(
-            router_groups is None and group_topk is None,
-            "args.moe_router_num_groups and args.moe_router_group_topk are both None when "
-            "quantile balancing is enabled",
-            (router_groups, group_topk),
-        )
-        return 1, 1
-
-    if not group_topk:
-        support.passed.append(
-            "group-limited routing is disabled (args.moe_router_group_topk is None or 0)"
-        )
-        return 1, 1
-
     support.require(
-        isinstance(router_groups, int)
-        and not isinstance(router_groups, bool)
-        and router_groups >= 1,
-        "args.moe_router_num_groups is a positive integer when group routing is enabled",
-        router_groups,
+        router_groups is None and group_topk is None,
+        "args.moe_router_num_groups and args.moe_router_group_topk are both None when "
+        "quantile balancing is enabled",
+        (router_groups, group_topk),
     )
-    support.require(
-        isinstance(group_topk, int)
-        and not isinstance(group_topk, bool)
-        and group_topk >= 1,
-        "args.moe_router_group_topk is a positive integer",
-        group_topk,
-    )
-    support.require(
-        expert_count % router_groups == 0,
-        "args.num_experts is divisible by args.moe_router_num_groups",
-        (expert_count, router_groups),
-    )
-    support.require(
-        group_topk <= router_groups,
-        "args.moe_router_group_topk <= args.moe_router_num_groups",
-        (group_topk, router_groups),
-    )
-    support.require(
-        group_topk <= topk,
-        "args.moe_router_group_topk <= args.moe_router_topk",
-        (group_topk, topk),
-    )
-    selected_group_capacity = group_topk * (expert_count // router_groups)
-    support.require(
-        topk <= selected_group_capacity,
-        "args.moe_router_topk fits inside the selected expert groups",
-        (topk, selected_group_capacity),
-    )
-    return router_groups, group_topk
+    return 1, 1
 
 
 def _derive_expert_storage(args: Namespace, support: _SupportBoundary) -> bool:
@@ -791,7 +734,6 @@ def _derive_quantile_balancing_method(
     args: Namespace,
     support: _SupportBoundary,
     *,
-    enabled: bool,
     override: str | None,
 ) -> str:
     """Resolve the QB selection score space for the exported config.
@@ -803,13 +745,6 @@ def _derive_quantile_balancing_method(
     ``--moe-router-quantile-balancing-method=legacy``.
     """
     saved_raw = getattr(args, "moe_router_quantile_balancing_method", None)
-    if not enabled:
-        override_note = " (explicit override ignored)" if override is not None else ""
-        support.passed.append(
-            "quantile balancing is disabled; moe_router_quantile_balancing_method is inactive"
-            f"{override_note}"
-        )
-        return "sigmoid"
 
     saved = QUANTILE_BALANCING_ALIASES.get(saved_raw, saved_raw)
     resolved_override = QUANTILE_BALANCING_ALIASES.get(override, override)
@@ -980,19 +915,17 @@ def derive_config(
         balancing,
     )
     use_quantile_balancing = "quantile_balancing" in balancing_methods
+    support.require(
+        use_quantile_balancing,
+        "'quantile_balancing' in args.moe_router_load_balancing_type (Apertus2 supports QB only)",
+        balancing,
+    )
     quantile_balancing_method = _derive_quantile_balancing_method(
         args,
         support,
-        enabled=use_quantile_balancing,
         override=moe_router_quantile_balancing_method,
     )
-    n_group, topk_group = _derive_group_limits(
-        args,
-        support,
-        expert_count=expert_count,
-        topk=topk,
-        use_quantile_balancing=use_quantile_balancing,
-    )
+    n_group, topk_group = _derive_group_limits(args, support)
 
     # The gate widens the fused QKV weight, so a wrong value here is also caught later by the
     # shape validation; deriving it (rather than defaulting) keeps config.json authoritative.
@@ -1048,6 +981,10 @@ def derive_config(
     kwargs.update(linear_attention_kwargs)
 
     expert_bias_present = bool(_req(args, "moe_router_enable_expert_bias"))
-    support.passed.append(f"args.moe_router_enable_expert_bias = {expert_bias_present}")
+    support.require(
+        not expert_bias_present,
+        "args.moe_router_enable_expert_bias is False (QB-only checkpoints have no expert bias)",
+        expert_bias_present,
+    )
 
     return DerivedConfig(kwargs, expert_bias_present, support.passed, offloaded_experts)

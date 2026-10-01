@@ -51,21 +51,19 @@ TINY_EPS = 1e-5
 TINY_EMBEDDING_MULTIPLIER = math.sqrt(TINY_HIDDEN)  # 5.656854249492381
 TINY_RESIDUAL_MULTIPLIER = 1.0 / math.sqrt(2 * TINY_LAYERS)  # 0.4082482904638631
 
-# Round-trip flag matrix: (id, sandwich, latent, qb, expert_bias_present).
-# QB + expert_bias on for (F,F) and (T,T); QB off elsewhere; plus one expert_bias-absent case.
+# QB-only round trips across the independent sandwich/latent features.
 ROUNDTRIP_COMBOS = [
-    ("plain-qb-bias", False, None, True, True),
-    ("sandwich", True, None, False, True),
-    ("latent", False, TINY_LATENT, False, True),
-    ("sandwich-latent-qb-bias", True, TINY_LATENT, True, True),
-    ("plain-no-expert-bias", False, None, False, False),
+    ("plain-qb", False, None, True, False),
+    ("sandwich-qb", True, None, True, False),
+    ("latent-qb", False, TINY_LATENT, True, False),
+    ("sandwich-latent-qb", True, TINY_LATENT, True, False),
 ]
 
 
 def tiny_export_config(
     sandwich_norm=False,
     moe_latent_size=None,
-    use_quantile_balancing=False,
+    use_quantile_balancing=True,
     **overrides,
 ):
     """Apertus2Config at the frozen tiny geometry, exporter-consistent multipliers."""
@@ -115,19 +113,15 @@ def tiny_export_config(
 def build_tiny_model(
     sandwich_norm=False,
     moe_latent_size=None,
-    use_quantile_balancing=False,
+    use_quantile_balancing=True,
     seed=0,
     randomize_router_buffers=True,
-    zero_expert_bias=False,
     **overrides,
 ):
     """Seeded tiny eval-mode Apertus2ForCausalLM.
 
-    randomize_router_buffers: fills the fp32 router buffers with non-zero seeded values so a
-    fidelity test actually distinguishes "copied" from "synthesized zeros" (the class inits
-    them to zeros, which would mask that bug class). zero_expert_bias keeps
-    e_score_correction_bias at zeros — required by the expert_bias-absent roundtrip combo,
-    where the exporter synthesizes fp32 zeros and the comparison target must equal them.
+    randomize_router_buffers fills QB thresholds with nonzero seeded values, so a
+    fidelity test distinguishes copied state from accidental zero initialization.
     """
     from modeling_apertus2 import Apertus2ForCausalLM
 
@@ -147,14 +141,6 @@ def build_tiny_model(
                 if not config.is_moe_layer(layer_idx):
                     continue
                 gate = layer.mlp.gate
-                if not zero_expert_bias:
-                    gate.e_score_correction_bias.copy_(
-                        torch.randn(
-                            gate.e_score_correction_bias.shape,
-                            generator=generator,
-                            dtype=torch.float32,
-                        )
-                    )
                 if getattr(gate, "qb_beta", None) is not None:
                     gate.qb_beta.copy_(
                         0.1
@@ -259,11 +245,11 @@ def _grab(state_dict, key):
     return tensor.detach().clone().contiguous()
 
 
-def to_megatron_tensors(model, config=None, expert_bias_present=True):
+def to_megatron_tensors(model, config=None, expert_bias_present=False):
     """Apertus2ForCausalLM (or its runtime state dict) -> fork-keyed {str: Tensor}.
 
     Key renames follow the production mapping in reverse. FP32 router buffers stay
-    fp32. e_score_correction_bias maps to router.expert_bias only when expert_bias_present;
+    fp32. expert_bias_present can inject an unsupported native buffer for negative tests;
     qb_beta maps to router.qb_beta only when config.use_quantile_balancing.
     """
     if isinstance(model, torch.nn.Module):
@@ -345,7 +331,7 @@ def to_megatron_tensors(model, config=None, expert_bias_present=True):
         )
         out[mg + "mlp.router.weight"] = _grab(state_dict, hf + "mlp.gate.weight")
         if expert_bias_present:
-            bias = _grab(state_dict, hf + "mlp.gate.e_score_correction_bias")
+            bias = torch.ones(config.n_routed_experts, dtype=torch.float32)
             assert bias.dtype == torch.float32, bias.dtype
             out[mg + "mlp.router.expert_bias"] = bias
         if config.use_quantile_balancing:
@@ -446,7 +432,7 @@ def kda_attention_key_triples(layer):
     ]
 
 
-def build_tiny_kda_checkpoint(seed=0, expert_bias_present=True):
+def build_tiny_kda_checkpoint(seed=0, expert_bias_present=False):
     """(megatron tensors, args, expected_hf, donor) for the tiny KDA combo.
 
     The HF modeling file fails closed on linear_attention layers until the KDA module lands,
@@ -457,7 +443,7 @@ def build_tiny_kda_checkpoint(seed=0, expert_bias_present=True):
     bit-identically; the donor covers the rest.
     """
     donor = build_tiny_model(
-        False, None, False, seed=seed, attention_output_gate=True
+        False, None, True, seed=seed, attention_output_gate=True
     )
     tensors = to_megatron_tensors(
         donor, donor.config, expert_bias_present=expert_bias_present
@@ -506,7 +492,7 @@ def _rope_theta(config):
     return float(config.rope_theta)
 
 
-def make_args_namespace(config, expert_bias_present=True, **overrides):
+def make_args_namespace(config, expert_bias_present=False, **overrides):
     """argparse.Namespace mirroring the fork's checkpoint args for `config`.
 
     scale_embeddings_by_sqrt_hidden / residual_output_scaling are derived from the config's
@@ -718,7 +704,7 @@ def _self_check(tmp_root):
 
     import megatron.core.dist_checkpointing as dist_checkpointing
 
-    sandwich, latent, qb, expert_bias = True, TINY_LATENT, True, True
+    sandwich, latent, qb, expert_bias = True, TINY_LATENT, True, False
     model = build_tiny_model(sandwich, latent, qb, seed=0)
     tensors = to_megatron_tensors(model, model.config, expert_bias_present=expert_bias)
     args = make_args_namespace(model.config, expert_bias_present=expert_bias)

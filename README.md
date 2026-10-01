@@ -61,8 +61,8 @@ straddling its boundary.
 
 Stage 2 derives the Hugging Face architecture from the checkpoint's saved
 arguments and refuses any feature it cannot represent exactly. Supported
-checkpoints cover dense/MoE layer schedules, sigmoid routing with quantile
-balancing and expert bias, routed-expert latent spaces, shared experts,
+checkpoints cover dense/MoE layer schedules, quantile-balanced routing
+with expert bias disabled, routed-expert latent spaces, shared experts,
 SSSGLU, sandwich and QK normalization, sliding-window/NoPE attention
 schedules, and the attention output gate. The exporter plans every output
 tensor up front, then streams the checkpoint one safetensors shard at a
@@ -72,6 +72,22 @@ reloads each written shard for a bitwise comparison. The export ends with the
 tokenizer, `config.json`, the custom model code, and a
 `conversion_info.json` certificate; a failed run deliberately leaves an
 `.export_incomplete` marker for diagnosis.
+
+Apertus2 supports **QB routing only**. Native checkpoints must include
+`quantile_balancing` in `moe_router_load_balancing_type` and set
+`moe_router_enable_expert_bias=False`. Non-QB checkpoints are rejected;
+changing their config flag does not convert their routing. Both sigmoid-space
+QB and legacy raw-logit QB retain their original selection math.
+
+New exports contain FP32 `mlp.gate.qb_beta` and omit
+`mlp.gate.e_score_correction_bias`. The updated HF model accepts that extra
+buffer from older QB exports only when it is zero. Saved HF configs must
+explicitly declare `use_quantile_balancing=True`; the serializer retains this
+field even though new configs default to QB.
+
+Bridge should use the updated `configuration_apertus2.py` and
+`modeling_apertus2.py` as its HF reference assets. Existing export directories
+keep their bundled Python files until explicitly updated or re-exported.
 
 ## Load the exported model
 

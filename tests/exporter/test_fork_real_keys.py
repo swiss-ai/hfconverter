@@ -106,7 +106,7 @@ def exporter_plan(fork_dump):
         use_qk_norm=True, sandwich_norm=True, moe_latent_size=None,
         use_quantile_balancing=True,
     )
-    return build_plan(cfg, expert_bias_present=True)
+    return build_plan(cfg, expert_bias_present=False)
 
 
 class TestForkKeyNamespace:
@@ -131,7 +131,7 @@ class TestForkKeyNamespace:
         keys = set(fork_dump["keys"])
         assert "decoder.layers.1.mlp.shared_experts.linear_fc1.weight" in keys
         assert "decoder.layers.1.mlp.router.weight" in keys
-        assert "decoder.layers.1.mlp.router.expert_bias" in keys
+        assert "decoder.layers.1.mlp.router.expert_bias" not in keys
         assert "decoder.layers.1.mlp.router.qb_beta" in keys
 
     def test_shapes_match_the_mapping_table(self, fork_dump, exporter_plan):
@@ -292,30 +292,9 @@ class TestRealCheckpointKeys:
         rows = real["keys"]["embedding.word_embeddings.weight"][0]
         assert rows == real["args"].padded_vocab_size == 200064
 
-    def test_derive_config_accepts_the_real_training_args(self, real):
-        # The exporter's arg audit, run against a REAL Namespace produced by a real training run.
-        derived = derive_config(real["args"])
-        kwargs = derived.kwargs
-        assert kwargs["hidden_size"] == 768
-        assert kwargs["num_hidden_layers"] == 10
-        assert kwargs["n_routed_experts"] == 128
-        assert kwargs["num_experts_per_tok"] == 4
-        assert kwargs["first_k_dense_replace"] == 1
-        assert kwargs["moe_intermediate_size"] == 448
-        assert kwargs["n_shared_experts"] == 1
-        assert kwargs["vocab_size"] == 200064
-        assert kwargs["head_dim"] == 128
-        assert kwargs["num_key_value_heads"] == 3
-        assert kwargs["routed_scaling_factor"] == 2.5
-        assert kwargs["rope_parameters"]["rope_theta"] == 500000.0
-        # this run: expert-bias router, no sandwich, no latent, no QB
-        assert derived.expert_bias_present is True
-        assert kwargs["sandwich_norm"] is False
-        assert kwargs["moe_latent_size"] is None
-        assert kwargs["use_quantile_balancing"] is False
-        # both scalar multipliers were ON in this run
-        assert kwargs["embedding_multiplier"] == pytest.approx(768 ** 0.5)
-        assert kwargs["residual_multiplier"] == pytest.approx(1.0 / (2 * 10) ** 0.5)
+    def test_real_non_qb_checkpoint_is_rejected(self, real):
+        with pytest.raises(ValueError, match="supports QB only"):
+            derive_config(real["args"])
 
 
 @pytest.fixture(scope="module")

@@ -26,12 +26,12 @@ import megatron_mock  # noqa: E402
 
 
 def _make_checkpoint(tmp_path, extra_tensors=None, drop_key=None, name="ckpt"):
-    """Good (F,F, no QB, expert_bias on) tiny checkpoint with optional mutations."""
-    model = megatron_mock.build_tiny_model(False, None, False, seed=0)
-    tensors = megatron_mock.to_megatron_tensors(model, model.config, expert_bias_present=True)
+    """QB checkpoint with expert bias disabled and optional invalid tensors."""
+    model = megatron_mock.build_tiny_model(False, None, True, seed=0)
+    tensors = megatron_mock.to_megatron_tensors(model, model.config, expert_bias_present=False)
     if drop_key is not None:
         del tensors[drop_key]
-    args = megatron_mock.make_args_namespace(model.config, expert_bias_present=True)
+    args = megatron_mock.make_args_namespace(model.config, expert_bias_present=False)
     checkpoint_dir = tmp_path / name
     megatron_mock.save_synthetic_checkpoint(
         tensors, args, checkpoint_dir, extra_tensors=extra_tensors

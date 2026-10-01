@@ -35,7 +35,7 @@ TINY_SHARD = "5KB"
 
 def _build_and_save(tmp_path, sandwich, latent, qb, expert_bias, seed=7):
     model = megatron_mock.build_tiny_model(
-        sandwich, latent, qb, seed=seed, zero_expert_bias=not expert_bias
+        sandwich, latent, qb, seed=seed
     )
     tensors = megatron_mock.to_megatron_tensors(
         model, model.config, expert_bias_present=expert_bias
@@ -58,7 +58,7 @@ class TestPlanShardsMatchesHub:
     """plan_shards() from metadata == split_torch_state_dict_into_shards() from real tensors."""
 
     def test_layout_is_byte_for_byte_the_hub_decision(self, dist_env, tmp_path):
-        _, ckpt = _build_and_save(tmp_path, True, megatron_mock.TINY_LATENT, True, True)
+        _, ckpt = _build_and_save(tmp_path, True, megatron_mock.TINY_LATENT, True, False)
 
         args, _ = reader.load_args(ckpt)
         derived = config_from_args.derive_config(args)
@@ -87,8 +87,8 @@ class TestStreamingMultiShardBitwise:
     @pytest.mark.parametrize(
         "sandwich,latent,qb,expert_bias",
         [
-            pytest.param(True, megatron_mock.TINY_LATENT, True, True, id="sandwich-latent-qb-bias"),
-            pytest.param(False, None, False, False, id="no-bias-synth-zeros"),
+            pytest.param(True, megatron_mock.TINY_LATENT, True, False, id="sandwich-latent-qb"),
+            pytest.param(False, None, True, False, id="qb-no-correction-buffer"),
         ],
     )
     def test_straddling_sources_reload_bitwise(
@@ -128,7 +128,7 @@ class TestStreamingMultiShardBitwise:
     def test_shard_size_does_not_change_tensor_bytes(self, dist_env, tmp_path):
         """The same checkpoint exported single-shard vs heavily-sharded is bitwise-equal per key —
         proving the streaming split is a pure output-layout change, not a data change."""
-        _, ckpt = _build_and_save(tmp_path, True, megatron_mock.TINY_LATENT, True, True)
+        _, ckpt = _build_and_save(tmp_path, True, megatron_mock.TINY_LATENT, True, False)
         one = tmp_path / "one"
         many = tmp_path / "many"
         export_checkpoint(ckpt, one, max_shard_size="5GB")

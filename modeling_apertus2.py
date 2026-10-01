@@ -554,77 +554,37 @@ class Apertus2TopkRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.n_routed_experts
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
-        self.use_quantile_balancing = config.use_quantile_balancing
         self.quantile_balancing_method = config.moe_router_quantile_balancing_method
 
         # The router sees full hidden states even when routed experts use a latent dimension.
         self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size)))
         # from_pretrained keeps selection offsets in fp32 so checkpoint loading does not round a
         # top-k boundary. A later explicit model.to(lower_dtype) follows normal PyTorch semantics.
-        self.register_buffer("e_score_correction_bias", torch.zeros((self.num_experts), dtype=torch.float32))
-        # QB replaces correction-bias selection.  Its buffer is absent when QB is disabled so
-        # checkpoint keys continue to describe the architecture exactly.
-        if config.use_quantile_balancing:
-            self.register_buffer("qb_beta", torch.zeros((self.num_experts), dtype=torch.float32))
-
-    def _select_experts_with_group_limit(self, selection_scores: torch.Tensor) -> torch.Tensor:
-        """Choose top-k experts, optionally restricting each token to its best expert groups."""
-        if self.n_group == 1 and self.topk_group == 1:
-            return torch.topk(selection_scores, k=self.top_k, dim=-1, sorted=False).indices
-
-        experts_per_group = self.num_experts // self.n_group
-        experts_used_to_rank_group = self.top_k // self.topk_group
-
-        # [tokens, E] -> [tokens, groups, experts_per_group].  A group's score is the sum of
-        # its strongest candidates, matching Megatron's group_limited_topk.
-        scores_by_group = selection_scores.view(-1, self.n_group, experts_per_group)
-        strongest_in_each_group = scores_by_group.topk(experts_used_to_rank_group, dim=-1).values
-        group_scores = strongest_in_each_group.sum(dim=-1)
-        selected_groups = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False).indices
-
-        selected_group_mask = torch.zeros_like(group_scores)
-        selected_group_mask.scatter_(1, selected_groups, 1)
-        selected_expert_mask = (
-            selected_group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, experts_per_group)
-            .reshape(-1, self.num_experts)
-            .bool()
-        )
-        scores_in_selected_groups = selection_scores.masked_fill(~selected_expert_mask, float("-inf"))
-        return torch.topk(scores_in_selected_groups, k=self.top_k, dim=-1, sorted=False).indices
+        self.register_buffer("qb_beta", torch.zeros((self.num_experts), dtype=torch.float32))
 
     def route_tokens_to_experts(self, router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Turn raw ``[tokens, E]`` router logits into expert ids and mixture weights.
 
         Selection offsets decide *which* experts run, but never alter their mixture weights:
 
-        - standard routing selects from ``sigmoid(logits) + correction_bias``;
         - quantile balancing selects from ``sigmoid(logits) - qb_beta`` by default, or from
           raw ``logits - qb_beta`` under the ``legacy`` method;
-        - both gather weights from the same bias-free ``sigmoid(logits)`` tensor;
+        - mixture weights come from the bias-free ``sigmoid(logits)`` tensor;
         - gathered weights are normalized first and multiplied by the routing scale last.
         """
         gate_scores = router_logits.sigmoid()
-        if self.use_quantile_balancing:
-            # QB and correction bias are mutually exclusive selection paths.  The config
-            # normalizes Megatron's estimator names, so only the canonical pair reaches here.
-            if self.quantile_balancing_method == "legacy":
-                qb_scores = router_logits
-            elif self.quantile_balancing_method == "sigmoid":
-                qb_scores = gate_scores
-            else:
-                raise ValueError(
-                    "unsupported moe_router_quantile_balancing_method at runtime: "
-                    f"{self.quantile_balancing_method!r}"
-                )
-            selection_scores = qb_scores - self.qb_beta
-            selected_experts = torch.topk(selection_scores, k=self.top_k, dim=-1, sorted=False).indices
+        if self.quantile_balancing_method == "legacy":
+            qb_scores = router_logits
+        elif self.quantile_balancing_method == "sigmoid":
+            qb_scores = gate_scores
         else:
-            selection_scores = gate_scores + self.e_score_correction_bias
-            selected_experts = self._select_experts_with_group_limit(selection_scores)
+            raise ValueError(
+                "unsupported moe_router_quantile_balancing_method at runtime: "
+                f"{self.quantile_balancing_method!r}"
+            )
+        selection_scores = qb_scores - self.qb_beta
+        selected_experts = torch.topk(selection_scores, k=self.top_k, dim=-1, sorted=False).indices
 
         expert_weights = gate_scores.gather(1, selected_experts)
         if self.norm_topk_prob:
@@ -886,6 +846,49 @@ class Apertus2PreTrainedModel(PreTrainedModel):
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
+    _keys_to_ignore_on_load_unexpected = [r"\.mlp\.gate\.e_score_correction_bias$"]
+
+    @staticmethod
+    def _validate_legacy_correction_bias(name, tensor):
+        if torch.count_nonzero(tensor):
+            raise ValueError(f"QB-only Apertus2 cannot discard nonzero legacy correction buffer {name}")
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Accept the unused zero buffers in older QB state dictionaries."""
+        legacy = [name for name in state_dict if name.endswith(".mlp.gate.e_score_correction_bias")]
+        if legacy:
+            original = state_dict
+            state_dict = state_dict.copy()
+            if hasattr(original, "_metadata"):
+                state_dict._metadata = original._metadata
+            for name in legacy:
+                self._validate_legacy_correction_bias(name, state_dict.pop(name))
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    @staticmethod
+    def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, expected_keys=None):
+        """Validate legacy buffers before Transformers filters unexpected checkpoint keys."""
+        if state_dict is not None:
+            for name, tensor in state_dict.items():
+                if name.endswith(".mlp.gate.e_score_correction_bias"):
+                    model._validate_legacy_correction_bias(name, tensor)
+        else:
+            from safetensors import safe_open
+
+            for path in checkpoint_files or ():
+                if str(path).endswith(".safetensors"):
+                    with safe_open(path, framework="pt", device="cpu") as shard:
+                        for name in shard.keys():
+                            if name.endswith(".mlp.gate.e_score_correction_bias"):
+                                model._validate_legacy_correction_bias(name, shard.get_tensor(name))
+                else:
+                    shard = torch.load(path, map_location="cpu", weights_only=True)
+                    for name, tensor in shard.items():
+                        if name.endswith(".mlp.gate.e_score_correction_bias"):
+                            model._validate_legacy_correction_bias(name, tensor)
+        return PreTrainedModel._load_pretrained_model(
+            model, state_dict, checkpoint_files, load_config, expected_keys
+        )
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
@@ -904,7 +907,7 @@ class Apertus2PreTrainedModel(PreTrainedModel):
     # Router offsets must survive low-precision checkpoint loading in float32.  KDA's decay
     # parameters stay fp32 as well, mirroring the fork's master copies and vLLM's loader (the
     # checkpoint stores them bf16; the copy upcasts).
-    _keep_in_fp32_modules_strict = ["e_score_correction_bias", "qb_beta", "A_log", "dt_bias"]
+    _keep_in_fp32_modules_strict = ["qb_beta", "A_log", "dt_bias"]
 
     def _reject_tensor_parallel(self) -> None:
         """Fail loudly on TP ranks: tensor parallelism is intentionally unsupported for now.
@@ -933,9 +936,7 @@ class Apertus2PreTrainedModel(PreTrainedModel):
         # The router and stacked expert parameters are raw nn.Parameters, so initialize them here.
         if isinstance(module, Apertus2TopkRouter):
             init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
-            init.zeros_(module.e_score_correction_bias)
-            if getattr(module, "qb_beta", None) is not None:  # QB only (buffer absent otherwise)
-                init.zeros_(module.qb_beta)
+            init.zeros_(module.qb_beta)
         elif isinstance(module, Apertus2NaiveMoe):
             init.normal_(module.gate_up_proj, mean=0.0, std=self.config.initializer_range)
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)

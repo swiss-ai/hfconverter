@@ -44,7 +44,7 @@ EXPERTS_FC2 = "experts_slice_fc2"  # slice expert axis 0
 # two variants transpose before doing exactly what their non-transposed counterparts do.
 EXPERTS_FC1_T = "experts_slice_transpose_split_fc1"
 EXPERTS_FC2_T = "experts_slice_transpose_fc2"
-SYNTH = "synth_zeros"  # HF tensor with no source (expert_bias off) -> zeros; produce_one only
+SYNTH = "synth_zeros"  # Retained for the generic writer; QB plans have no synthesized tensors.
 
 _DROP_PREFIXES = ("optimizer.", "opt_param_scheduler")
 
@@ -76,7 +76,7 @@ class Row:
 
 @dataclass(frozen=True)
 class SynthesizedTensor:
-    """An HF tensor with no Megatron source (expert_bias off -> zeros), for conversion_info."""
+    """An HF tensor with no Megatron source, recorded in conversion_info."""
 
     hf_key: str
     shape: tuple[int, ...]
@@ -516,37 +516,17 @@ def _moe_mlp_rows(
         ),
     ]
     synthesized: list[SynthesizedTensor] = []
-    if expert_bias_present:
-        rows.append(
-            Row(
-                f"{megatron}.mlp.router.expert_bias",
-                (f"{hf}.mlp.gate.e_score_correction_bias",),
-                COPY,
-                (experts,),
-                torch.float32,
-            )
+    if not shape.use_quantile_balancing or expert_bias_present:
+        raise ValueError("Apertus2 supports only QB routing with expert bias disabled")
+    rows.append(
+        Row(
+            f"{megatron}.mlp.router.qb_beta",
+            (f"{hf}.mlp.gate.qb_beta",),
+            COPY,
+            (experts,),
+            torch.float32,
         )
-    else:
-        # The HF router always owns this buffer. When Megatron disabled it, zeros reproduce the
-        # absence of a correction while keeping the HF state dict complete.
-        synthesized.append(
-            SynthesizedTensor(
-                f"{hf}.mlp.gate.e_score_correction_bias",
-                (experts,),
-                torch.float32,
-                "args.moe_router_enable_expert_bias is False: synthesized fp32 zeros",
-            )
-        )
-    if shape.use_quantile_balancing:
-        rows.append(
-            Row(
-                f"{megatron}.mlp.router.qb_beta",
-                (f"{hf}.mlp.gate.qb_beta",),
-                COPY,
-                (experts,),
-                torch.float32,
-            )
-        )
+    )
     if shape.latent_size:
         rows.extend(
             [
@@ -593,6 +573,8 @@ def build_plan(
     cfg: dict[str, Any], expert_bias_present: bool, offloaded_experts: bool = False
 ) -> Plan:
     """Build the complete source-to-output mapping in model execution order."""
+    if cfg.get("use_quantile_balancing") is not True or expert_bias_present:
+        raise ValueError("Apertus2 supports only QB routing with expert bias disabled")
     shape = _Geometry.from_config(cfg)
     rows = _model_level_rows(shape)
     synthesized: list[SynthesizedTensor] = []

@@ -87,8 +87,10 @@ def derive_config(args, **kwargs):
     return Apertus2Config(**kwargs)
 
 
-def good_args(sandwich=False, latent=None, qb=False, expert_bias=True, **overrides):
-    config = megatron_mock.tiny_export_config(sandwich, latent, qb)
+def good_args(sandwich=False, latent=None, qb=True, expert_bias=False, **overrides):
+    config = megatron_mock.tiny_export_config(sandwich, latent, True)
+    if not qb:
+        overrides.setdefault("moe_router_load_balancing_type", "aux_loss")
     return megatron_mock.make_args_namespace(
         config, expert_bias_present=expert_bias, **overrides
     )
@@ -123,7 +125,7 @@ class TestDerivations:
         assert config.use_qk_norm is True
         assert config.sandwich_norm is False
         assert config.moe_latent_size is None
-        assert config.use_quantile_balancing is False
+        assert config.use_quantile_balancing is True
         assert config.moe_router_quantile_balancing_method == "sigmoid"
         assert config.tie_word_embeddings is False
         assert config.norm_topk_prob is True
@@ -151,22 +153,13 @@ class TestDerivations:
             pytest.param(4, 2, id="four-groups-select-two"),
         ],
     )
-    def test_group_limited_routing_lands_in_config(self, n_group, topk_group):
-        config = derive_config(
-            good_args(
-                moe_router_num_groups=n_group,
-                moe_router_group_topk=topk_group,
-            )
-        )
-        assert config.n_group == n_group
-        assert config.topk_group == topk_group
+    def test_group_limited_routing_is_rejected(self, n_group, topk_group):
+        with pytest.raises(ValueError, match="quantile balancing"):
+            derive_config(good_args(moe_router_num_groups=n_group, moe_router_group_topk=topk_group))
 
-    def test_group_count_without_group_topk_is_an_inactive_megatron_setting(self):
-        config = derive_config(
-            good_args(moe_router_num_groups=4, moe_router_group_topk=None)
-        )
-        assert config.n_group == 1
-        assert config.topk_group == 1
+    def test_qb_rejects_group_count_without_group_topk(self):
+        with pytest.raises(ValueError, match="quantile balancing"):
+            derive_config(good_args(moe_router_num_groups=4, moe_router_group_topk=None))
 
     @pytest.mark.parametrize(
         "overrides,expected_message",
@@ -207,7 +200,7 @@ class TestDerivations:
         ],
     )
     def test_invalid_group_limited_geometry_is_rejected(self, overrides, expected_message):
-        with pytest.raises(ValueError, match=expected_message):
+        with pytest.raises(ValueError, match="quantile balancing"):
             derive_config(good_args(**overrides))
 
     def test_quantile_balancing_and_group_limited_routing_are_rejected(self):
@@ -301,8 +294,12 @@ class TestDerivations:
         ],
     )
     def test_quantile_balancing_detection(self, balancing, expected_qb):
+        if not expected_qb:
+            with pytest.raises(ValueError, match="supports QB only"):
+                derive_config(good_args(moe_router_load_balancing_type=balancing))
+            return
         config = derive_config(good_args(moe_router_load_balancing_type=balancing))
-        assert config.use_quantile_balancing is expected_qb
+        assert config.use_quantile_balancing is True
 
     @pytest.mark.parametrize(
         "saved, expected",
@@ -340,14 +337,9 @@ class TestDerivations:
         config = derive_config(args, moe_router_quantile_balancing_method="sigmoid")
         assert config.moe_router_quantile_balancing_method == "sigmoid"
 
-    def test_qb_method_override_is_ignored_when_qb_is_disabled(self):
-        config = derive_config(
-            good_args(qb=False),
-            moe_router_quantile_balancing_method="legacy",
-        )
-        assert config.use_quantile_balancing is False
-        assert config.moe_router_quantile_balancing_method == "sigmoid"
-
+    def test_qb_method_override_cannot_enable_non_qb_checkpoint(self):
+        with pytest.raises(ValueError, match="supports QB only"):
+            derive_config(good_args(qb=False), moe_router_quantile_balancing_method="legacy")
     def test_invalid_qb_method_is_rejected(self):
         with pytest.raises(ValueError, match="moe_router_quantile_balancing_method"):
             derive_config(
@@ -356,6 +348,10 @@ class TestDerivations:
 
     @pytest.mark.parametrize("enabled", [True, False])
     def test_expert_bias_present_returned_alongside(self, enabled):
+        if enabled:
+            with pytest.raises(ValueError, match="expert_bias is False"):
+                derive(good_args(expert_bias=True))
+            return
         _, expert_bias_present, raw = derive(good_args(expert_bias=enabled))
         assert expert_bias_present is not None, (
             "expert_bias_present (= args.moe_router_enable_expert_bias) must "

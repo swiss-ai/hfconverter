@@ -35,9 +35,9 @@ EXPERT_FFN = 5  # expert hidden width  (moe_ffn_hidden_size)
 
 def build_config(**overrides):
     """Tiny HF config kwargs with a latent MoE, so expert input width != hidden size."""
-    config = megatron_mock.tiny_export_config(False, LATENT_IN, False)
+    config = megatron_mock.tiny_export_config(False, LATENT_IN, True)
     args = megatron_mock.make_args_namespace(
-        config, expert_bias_present=True, moe_ffn_hidden_size=EXPERT_FFN,
+        config, expert_bias_present=False, moe_ffn_hidden_size=EXPERT_FFN,
         moe_shared_expert_intermediate_size=EXPERT_FFN, num_experts=EXPERTS,
         moe_router_topk=2, moe_latent_size=LATENT_IN, **overrides,
     )
@@ -61,7 +61,7 @@ def build_weight2(dtype=torch.float32):
 class TestDerivedLayoutSelection:
     def test_offloading_selects_the_fused_transposed_keys(self):
         derived = build_config(moe_use_offloading_experts=True)
-        plan = mapping.build_plan(derived.kwargs, True, derived.offloaded_experts)
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present, derived.offloaded_experts)
         sources = {row.megatron_key for row in plan.rows}
         assert any(k.endswith("mlp.experts.experts.weight1") for k in sources)
         assert any(k.endswith("mlp.experts.experts.weight2") for k in sources)
@@ -69,7 +69,7 @@ class TestDerivedLayoutSelection:
 
     def test_grouped_layout_is_still_the_default(self):
         derived = build_config()
-        plan = mapping.build_plan(derived.kwargs, True, derived.offloaded_experts)
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present, derived.offloaded_experts)
         sources = {row.megatron_key for row in plan.rows}
         assert any(k.endswith("mlp.experts.experts.linear_fc1.weight") for k in sources)
         assert not any(k.endswith("mlp.experts.experts.weight1") for k in sources)
@@ -78,7 +78,7 @@ class TestDerivedLayoutSelection:
         # validate_metadata compares Row.shape against the checkpoint's global shape, so it must
         # describe the file, not the nn.Linear orientation the outputs end up in.
         derived = build_config(moe_use_offloading_experts=True)
-        plan = mapping.build_plan(derived.kwargs, True, derived.offloaded_experts)
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present, derived.offloaded_experts)
         by_key = {row.megatron_key: row for row in plan.rows}
         fc1 = next(r for k, r in by_key.items() if k.endswith("weight1"))
         fc2 = next(r for k, r in by_key.items() if k.endswith("weight2"))
@@ -92,7 +92,7 @@ class TestDerivedLayoutSelection:
         # shard layout and its byte totals would be identical and nothing would complain until
         # produce_one's final assertion, long after the output directory was claimed.
         derived = build_config(moe_use_offloading_experts=True)
-        plan = mapping.build_plan(derived.kwargs, True, derived.offloaded_experts)
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present, derived.offloaded_experts)
         specs = {s.hf_key: s for s in mapping.plan_hf_tensors(plan, torch.float32)}
         layer = derived.kwargs["first_k_dense_replace"]
         for expert in range(EXPERTS):
@@ -108,7 +108,7 @@ class TestTransposedConversion:
     @staticmethod
     def _converted(dtype=torch.float32):
         derived = build_config(moe_use_offloading_experts=True)
-        plan = mapping.build_plan(derived.kwargs, True, derived.offloaded_experts)
+        plan = mapping.build_plan(derived.kwargs, derived.expert_bias_present, derived.offloaded_experts)
         tensors = {}
         for row in plan.rows:
             if row.megatron_key.endswith("weight1"):

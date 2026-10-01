@@ -218,7 +218,6 @@ def _expected_disk_keys(config):
             keys.add(p + "post_feedforward_layernorm.weight")
         if config.is_moe_layer(L):
             keys.add(p + "mlp.gate.weight")
-            keys.add(p + "mlp.gate.e_score_correction_bias")
             if config.use_quantile_balancing:
                 keys.add(p + "mlp.gate.qb_beta")
             if config.moe_latent_size is not None:
@@ -278,7 +277,7 @@ class TestContractPlumbing:
         assert cfg.topk_group == 1
         assert cfg.sandwich_norm is False
         assert cfg.moe_latent_size is None
-        assert cfg.use_quantile_balancing is False
+        assert cfg.use_quantile_balancing is True
         assert cfg.moe_router_quantile_balancing_method == "sigmoid"
         assert cfg.embedding_multiplier == EMBEDDING_MULTIPLIER
         assert cfg.residual_multiplier == RESIDUAL_MULTIPLIER
@@ -337,7 +336,7 @@ class TestContractPlumbing:
         assert restored.moe_router_quantile_balancing_method == expected
 
     def test_pretrained_model_flags(self):
-        assert "e_score_correction_bias" in Apertus2ForCausalLM._keep_in_fp32_modules_strict
+        assert "e_score_correction_bias" not in Apertus2ForCausalLM._keep_in_fp32_modules_strict
         assert "Apertus2DecoderLayer" in Apertus2ForCausalLM._no_split_modules
         assert not Apertus2ForCausalLM._tied_weights_keys  # untied: EMPTY
 
@@ -872,193 +871,92 @@ class TestLatentMoeOrdering:
 # ---------------------------------------------------------------------------
 
 
-class TestRouterCorrectionBias:
-    def _moe_and_logits(self, make_model, n_tokens=6):
-        model = make_model(False, None)
-        moe = model.model.layers[1].mlp
-        generator = torch.Generator().manual_seed(7)
-        x = torch.randn(n_tokens, TINY_HIDDEN, generator=generator)
-        with torch.no_grad():
-            logits, _, _ = moe.gate(x)  # fp32 pre-sigmoid router logits
-        return moe, logits
+class TestQuantileBalancing:
+    def test_qb_config_rejects_expert_bias(self):
+        with pytest.raises(ValueError, match="expert_bias=False"):
+            Apertus2Config(moe_router_enable_expert_bias=True)
 
-    def _bias_free_reference(self, moe, logits, idx):
-        """The contract gate values: gather BIAS-FREE sigmoid scores at the
-        selected indices, renorm by their sum FIRST, then * routed_scaling_factor.
-        (Scaling BEFORE the renorm would cancel the factor; skipping the renorm
-        changes the values — both are pinned here.)"""
-        scores = logits.sigmoid()
-        ref = scores.gather(1, idx)
-        ref = ref / (ref.sum(dim=-1, keepdim=True) + 1e-20)
-        return ref * moe.gate.routed_scaling_factor
+    @pytest.mark.parametrize("saved_flag", [False, None])
+    def test_saved_config_must_explicitly_declare_qb(self, saved_flag):
+        saved = Apertus2Config().to_dict()
+        if saved_flag is None:
+            saved.pop("use_quantile_balancing")
+        else:
+            saved["use_quantile_balancing"] = saved_flag
+        with pytest.raises(ValueError, match="explicitly declare use_quantile_balancing=True"):
+            Apertus2Config.from_dict(saved)
 
-    def test_gate_values_ignore_correction_bias(self, make_model):
-        moe, logits = self._moe_and_logits(make_model)
-        generator = torch.Generator().manual_seed(11)
-        with torch.no_grad():
-            # NONZERO bias: gathering from the biased scores would visibly differ
-            moe.gate.e_score_correction_bias.copy_(
-                torch.randn(TINY_N_EXPERTS, generator=generator).abs() + 0.5
-            )
-            idx, weights = moe.gate.route_tokens_to_experts(logits)
-            ref = self._bias_free_reference(moe, logits, idx)
-        assert idx.shape == weights.shape == (logits.shape[0], TINY_TOPK)
-        torch.testing.assert_close(weights, ref, rtol=1e-6, atol=1e-6)
-
-    def test_correction_bias_changes_topk_selection(self, make_model):
-        moe, logits = self._moe_and_logits(make_model)
-        with torch.no_grad():
-            moe.gate.e_score_correction_bias.zero_()
-            idx0, _ = moe.gate.route_tokens_to_experts(logits)
-            # the expert picked by the FEWEST tokens under zero bias (6 tokens x
-            # top-2 = 12 slots over 8 experts -> some expert has count <= 1)
-            counts = torch.zeros(TINY_N_EXPERTS)
-            counts.scatter_add_(0, idx0.reshape(-1), torch.ones(idx0.numel()))
-            j = int(counts.argmin())
-            assert counts[j] < logits.shape[0], "least-picked expert already picked by every token"
-            forced = torch.zeros(TINY_N_EXPERTS)
-            forced[j] = 1e4
-            moe.gate.e_score_correction_bias.copy_(forced)
-            idx1, weights1 = moe.gate.route_tokens_to_experts(logits)
-            ref1 = self._bias_free_reference(moe, logits, idx1)
-        # the bias DOES steer selection: expert j is now in every token's top-k...
-        assert (idx1 == j).any(dim=-1).all(), "large correction bias failed to force expert selection"
-        assert not torch.equal(torch.sort(idx1, dim=-1)[0], torch.sort(idx0, dim=-1)[0])
-        # ...while the gate values stay bias-free renormed-then-scaled sigmoid scores
-        torch.testing.assert_close(weights1, ref1, rtol=1e-6, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# group-limited routing: groups are ranked by the sum of their
-# top-(topk // group_topk) scores, NOT a hardcoded top-2 (fork
-# group_limited_topk, moe_utils.py:632-650). Dormant at the shipped
-# n_group=1/topk_group=1 — one group, the mask is all-ones — so no other test in
-# this suite ever executes the branch. The oracle below is transcribed from the
-# fork and does not import modeling_apertus2.
-# ---------------------------------------------------------------------------
-
-
-def _fork_group_limited_topk(scores, topk, num_groups, group_topk):
-    """Verbatim transcription of the fork's group_limited_topk
-    (megatron/core/transformer/moe/moe_utils.py:632-650)."""
-    num_tokens, num_experts = scores.shape
-    group_scores = (
-        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
-    )
-    group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1)
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_tokens, num_groups, num_experts // num_groups)
-        .reshape(num_tokens, -1)
-    )
-    masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
-    return torch.topk(masked_scores, k=topk, dim=-1)
-
-
-def _fork_route(logits, expert_bias, topk, num_groups, group_topk, scaling_factor):
-    """The fork's sigmoid + expert_bias + group-limited path, in order
-    (moe_utils.py:823-840, topk_routing_with_score_function): bias steers
-    SELECTION only, gate values gather bias-free scores, renorm only when
-    topk > 1, scaling_factor LAST."""
-    scores = torch.sigmoid(logits.float()).type_as(logits)
-    _, top_indices = _fork_group_limited_topk(scores + expert_bias, topk, num_groups, group_topk)
-    gathered = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
-    probs = gathered / (gathered.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else gathered
-    return probs * scaling_factor, top_indices
-
-
-def _dense(idx, weights, n_experts):
-    """[tokens, topk] -> [tokens, n_experts], so a comparison is independent of
-    top-k index ORDER (the fork's final topk sorts; route_tokens_to_experts
-    passes sorted=False)."""
-    out = torch.zeros(idx.shape[0], n_experts, dtype=weights.dtype)
-    out.scatter_(1, idx, weights)
-    return out
-
-
-class TestGroupLimitedRouting:
-    def test_group_ranking_uses_topk_over_group_topk_not_hardcoded_two(self, make_model):
-        """Scores chosen so the two rankings DISAGREE: group 0 wins on its top-2 sum
-        (1.8 > 1.6) but loses on its top-3 sum (1.9 < 2.4). With topk=3/group_topk=1
-        the fork ranks by the top-3 sum and selects group 1; a hardcoded top-2 ranking
-        selects group 0. Stating the scores and deriving the logits (rather than the
-        reverse) is what makes the arithmetic above checkable by eye."""
-        model = make_model(False, None, n_group=2, topk_group=1, num_experts_per_tok=3)
-        moe = model.model.layers[1].mlp
-        target_scores = torch.tensor([[0.9, 0.9, 0.1, 0.1, 0.8, 0.8, 0.8, 0.05]])
-        logits = torch.logit(target_scores)
-        with torch.no_grad():
-            idx, _ = moe.gate.route_tokens_to_experts(logits)
-        assert set(idx.reshape(-1).tolist()) == {4, 5, 6}, (
-            "expected the top-(topk//group_topk) ranking to select group 1 (experts 4-7); "
-            f"got {sorted(idx.reshape(-1).tolist())} — a top-2 group ranking would pick group 0"
-        )
-
+    @pytest.mark.parametrize("return_unused_kwargs", [False, True])
     @pytest.mark.parametrize(
-        "n_group, topk_group, top_k",
+        "override, message",
         [
-            pytest.param(2, 1, 3, id="g2-tg1-k3"),  # topk//group_topk = 3
-            pytest.param(2, 2, 2, id="g2-tg2-k2"),  # = 1
-            pytest.param(4, 2, 4, id="g4-tg2-k4"),  # = 2, the case a hardcoded 2 gets right
-            pytest.param(2, 1, 4, id="g2-tg1-k4"),  # = 4, the whole group
+            ({"use_quantile_balancing": False}, "only quantile balancing"),
+            ({"moe_router_enable_expert_bias": True}, "expert_bias=False"),
+            ({"n_group": 2}, "group-limited routing"),
+            ({"moe_router_quantile_balancing_method": "unsupported"}, "must be 'sigmoid' or 'legacy'"),
         ],
     )
-    def test_matches_fork_group_limited_reference(self, make_model, n_group, topk_group, top_k):
-        model = make_model(
-            False, None, n_group=n_group, topk_group=topk_group, num_experts_per_tok=top_k
-        )
-        moe = model.model.layers[1].mlp
-        generator = torch.Generator().manual_seed(23)
-        # 256 tokens, not a handful: whether a top-2 group ranking and the fork's
-        # top-(topk//group_topk) ranking DIVERGE is a property of the draw, and at 6
-        # tokens they routinely coincide — this test then passes against the very bug
-        # test_group_ranking_uses_topk_over_group_topk_not_hardcoded_two exists to
-        # catch. Enough tokens make divergence near-certain rather than lucky.
-        logits = torch.randn(256, TINY_N_EXPERTS, generator=generator)
-        with torch.no_grad():
-            # NONZERO bias: it must steer selection without reaching the gate values
-            bias = torch.randn(TINY_N_EXPERTS, generator=generator).abs() + 0.5
-            moe.gate.e_score_correction_bias.copy_(bias)
-            idx, weights = moe.gate.route_tokens_to_experts(logits)
-            ref_weights, ref_idx = _fork_route(
-                logits, bias, top_k, n_group, topk_group, moe.gate.routed_scaling_factor
-            )
-        assert idx.shape == weights.shape == (logits.shape[0], top_k)
-        torch.testing.assert_close(
-            _dense(idx, weights, TINY_N_EXPERTS),
-            _dense(ref_idx, ref_weights, TINY_N_EXPERTS),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-
-    def test_selection_confined_to_the_chosen_groups(self, make_model):
-        """topk_group=1 over 4 groups of 2 experts: the mask leaves exactly one group
-        alive, so every token's top-2 must be that group's contiguous expert pair."""
-        model = make_model(False, None, n_group=4, topk_group=1, num_experts_per_tok=2)
-        moe = model.model.layers[1].mlp
-        generator = torch.Generator().manual_seed(5)
-        logits = torch.randn(6, TINY_N_EXPERTS, generator=generator)
-        with torch.no_grad():
-            idx, _ = moe.gate.route_tokens_to_experts(logits)
-        for row in idx.tolist():
-            groups = {expert // 2 for expert in row}
-            assert len(groups) == 1, (
-                f"topk_group=1 must confine selection to ONE group; row {sorted(row)} spans {sorted(groups)}"
+    def test_qb_config_validates_loading_overrides(self, override, message, return_unused_kwargs):
+        with pytest.raises(ValueError, match=message):
+            Apertus2Config.from_dict(
+                Apertus2Config().to_dict(), return_unused_kwargs=return_unused_kwargs, **override
             )
 
+    @pytest.mark.parametrize("return_unused_kwargs", [False, True])
+    def test_qb_config_normalizes_loading_overrides(self, return_unused_kwargs):
+        result = Apertus2Config.from_dict(
+            Apertus2Config().to_dict(),
+            moe_router_quantile_balancing_method="legacy_average",
+            return_unused_kwargs=return_unused_kwargs,
+            unused_option="preserved",
+        )
+        if return_unused_kwargs:
+            config, unused = result
+            assert unused == {"unused_option": "preserved"}
+        else:
+            config = result
+        assert config.moe_router_quantile_balancing_method == "legacy"
 
-# ---------------------------------------------------------------------------
-# Quantile-balancing router: the default "sigmoid" method selects from sigmoid scores
-# minus qb_beta; "legacy" selects from RAW logits minus qb_beta (Megatron spellings
-# average/histogram/legacy_average normalize onto the pair). Gate values stay bias-free
-# renormed-then-scaled sigmoid scores in every method, and e_score_correction_bias is
-# ignored for selection when QB is on.
-# ---------------------------------------------------------------------------
+    @pytest.mark.parametrize("from_disk", [False, True])
+    @pytest.mark.parametrize("correction_value", [0.0, 1.0])
+    def test_legacy_correction_buffer_accepted_only_when_zero(
+        self, make_model, input_ids, tmp_path, from_disk, correction_value
+    ):
+        from safetensors.torch import save_file
 
+        model = make_model()
+        with torch.no_grad():
+            for layer in _moe_layers(model):
+                layer.mlp.gate.qb_beta.copy_(torch.linspace(-0.2, 0.3, TINY_N_EXPERTS))
+        if from_disk:
+            model.save_pretrained(tmp_path)
+            state = _load_saved_state_dict(tmp_path)
+        else:
+            state = model.state_dict()
+        for key in list(state):
+            if key.endswith(".gate.qb_beta"):
+                state[key.removesuffix("qb_beta") + "e_score_correction_bias"] = torch.full_like(
+                    state[key], correction_value
+                )
+        if from_disk:
+            save_file(state, tmp_path / "model.safetensors")
 
-class TestQuantileBalancing:
+        def load():
+            if from_disk:
+                return Apertus2ForCausalLM.from_pretrained(tmp_path)
+            restored = make_model(seed=7)
+            restored.load_state_dict(state, strict=True)
+            return restored
+
+        if correction_value:
+            with pytest.raises(ValueError, match="nonzero legacy correction buffer"):
+                load()
+            return
+        restored = load().eval()
+        assert not any("e_score_correction_bias" in key for key in restored.state_dict())
+        with torch.no_grad():
+            torch.testing.assert_close(restored(input_ids).logits, model(input_ids).logits, rtol=0, atol=0)
+
     def _sorted(self, idx):
         """Order-insensitive top-k index comparison (topk uses sorted=False)."""
         return torch.sort(idx, dim=-1)[0]
@@ -1095,15 +993,9 @@ class TestQuantileBalancing:
 
     # -- 1. buffer existence ------------------------------------------------
 
-    def test_flag_off_no_qb_beta_anywhere(self, make_model):
-        model = make_model(False, None)
-        assert not any("qb_beta" in k for k in model.state_dict()), (
-            "use_quantile_balancing=False but qb_beta tensors exist "
-            "(the buffer must be absent, not a zero placeholder)"
-        )
-        assert not any("qb_beta" in n for n, _ in model.named_buffers())
-        for layer in _moe_layers(model):
-            assert getattr(layer.mlp.gate, "qb_beta", None) is None
+    def test_non_qb_config_is_rejected(self, make_model):
+        with pytest.raises(ValueError, match="only quantile balancing"):
+            make_model(use_quantile_balancing=False)
 
     def test_flag_on_qb_beta_on_moe_gates_only(self, make_model):
         model = make_model(False, None, use_quantile_balancing=True)
@@ -1220,34 +1112,11 @@ class TestQuantileBalancing:
 
     # -- 4. e_score_correction_bias is ignored for selection under QB -------
 
-    def test_correction_bias_ignored_when_qb_on(self, make_model):
-        """With QB on and qb_beta=0, selection must be plain topk(logits) even
-        under a huge e_score_correction_bias. The contrast (QB off: the same
-        forced bias DOES change selection) is already pinned by
-        TestRouterCorrectionBias::test_correction_bias_changes_topk_selection."""
-        moe, logits = self._qb_moe_and_logits(make_model)
-        with torch.no_grad():
-            moe.gate.qb_beta.zero_()
-            plain_idx = torch.topk(logits, k=TINY_TOPK, dim=-1).indices
-            # same forced-bias construction as the QB-off contrast test
-            counts = torch.zeros(TINY_N_EXPERTS)
-            counts.scatter_add_(0, plain_idx.reshape(-1), torch.ones(plain_idx.numel()))
-            j = int(counts.argmin())
-            forced = torch.zeros(TINY_N_EXPERTS)
-            forced[j] = 1e4
-            moe.gate.e_score_correction_bias.copy_(forced)
-            idx, _ = moe.gate.route_tokens_to_experts(logits)
-        assert torch.equal(self._sorted(idx), self._sorted(plain_idx)), (
-            "with QB on, a large e_score_correction_bias changed the selection "
-            "— the expert bias must not participate in QB routing"
-        )
-        assert not (idx == j).any(dim=-1).all(), (
-            "the forced-bias expert entered every token's top-k — the "
-            "correction bias leaked into the QB selection path"
-        )
-
-    # -- 5. fp32 invariant ---------------------------------------------------
-
+    def test_qb_state_omits_correction_buffer(self, make_model):
+        model = make_model()
+        assert not any("e_score_correction_bias" in key for key in model.state_dict())
+        for layer in _moe_layers(model):
+            assert not hasattr(layer.mlp.gate, "e_score_correction_bias")
     def test_qb_beta_stays_fp32_under_bf16(self, make_model, tmp_path):
         model = make_model(True, TINY_LATENT, use_quantile_balancing=True)
         model.save_pretrained(str(tmp_path))
@@ -1256,7 +1125,7 @@ class TestQuantileBalancing:
         )
         for layer in _moe_layers(reloaded):
             assert layer.mlp.gate.qb_beta.dtype == torch.float32
-            assert layer.mlp.gate.e_score_correction_bias.dtype == torch.float32
+            assert not hasattr(layer.mlp.gate, "e_score_correction_bias")
             assert layer.mlp.gate.weight.dtype == torch.bfloat16
         assert "qb_beta" in Apertus2ForCausalLM._keep_in_fp32_modules_strict
 
@@ -1330,7 +1199,7 @@ class TestQuantileBalancing:
         cfg = Apertus2Config(use_quantile_balancing=True)  # n_group=topk_group=1: fine
         assert cfg.use_quantile_balancing is True
         assert cfg.moe_router_quantile_balancing_method == "sigmoid"
-        assert Apertus2Config().use_quantile_balancing is False
+        assert Apertus2Config().use_quantile_balancing is True
 
     @pytest.mark.parametrize(
         "method, expected",
@@ -1529,7 +1398,7 @@ class TestSaveLoadRoundTrip:
         assert disk[e0 + "gate_proj.weight"].shape == (TINY_MOE_INTERMEDIATE, in_dim)
         assert disk[e0 + "up_proj.weight"].shape == (TINY_MOE_INTERMEDIATE, in_dim)
         assert disk[e0 + "down_proj.weight"].shape == (in_dim, TINY_MOE_INTERMEDIATE)
-        assert disk["model.layers.1.mlp.gate.e_score_correction_bias"].dtype == torch.float32
+        assert disk["model.layers.1.mlp.gate.qb_beta"].dtype == torch.float32
 
         # save must be the exact inverse of the load-time fusion: expert i's
         # gate/up rows come from the fused container (gate first — the
@@ -1615,7 +1484,7 @@ class TestSaveLoadRoundTrip:
         assert not info["mismatched_keys"], info["mismatched_keys"]
         assert not info["error_msgs"], info["error_msgs"]
 
-    def test_e_score_correction_bias_stays_fp32_under_bf16(
+    def test_qb_router_state_stays_fp32_under_bf16(
         self, make_model, tmp_path
     ):
         """Requirement 8: _keep_in_fp32_modules_strict must protect the router
@@ -1632,7 +1501,7 @@ class TestSaveLoadRoundTrip:
             str(tmp_path), dtype=torch.bfloat16
         )
         for layer in _moe_layers(reloaded):
-            assert layer.mlp.gate.e_score_correction_bias.dtype == torch.float32
+            assert not hasattr(layer.mlp.gate, "e_score_correction_bias")
             assert layer.mlp.gate.weight.dtype == torch.bfloat16
         assert reloaded.model.embed_tokens.weight.dtype == torch.bfloat16
 
@@ -1725,6 +1594,10 @@ class TestStockGlm4MoeOracle:
         apertus_sd = apertus.state_dict()
         renamed = {}
         for key, value in apertus_sd.items():
+            if key.endswith(".gate.qb_beta"):
+                assert not torch.count_nonzero(value)
+                renamed[key.removesuffix("qb_beta") + "e_score_correction_bias"] = value
+                continue
             new_key = key
             for src, dst in APERTUS_TO_GLM4MOE_RENAMES:
                 new_key = new_key.replace(src, dst)

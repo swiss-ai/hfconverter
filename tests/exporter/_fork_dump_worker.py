@@ -100,7 +100,7 @@ def build_model(moe_layer_freq):
         moe_shared_expert_intermediate_size=MOE_FFN,
         moe_layer_freq=moe_layer_freq,
         moe_router_score_function="sigmoid",
-        moe_router_enable_expert_bias=True,
+        moe_router_enable_expert_bias=False,
         moe_router_load_balancing_type="quantile_balancing",
         moe_router_topk_scaling_factor=2.5,
         moe_grouped_gemm=False,  # SequentialMLP: fork pins its keys identical to TEGroupedMLP

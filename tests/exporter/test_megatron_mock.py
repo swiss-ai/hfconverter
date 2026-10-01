@@ -42,8 +42,8 @@ def expected_fork_keys(
     first_k_dense=1,
     sandwich=False,
     latent=False,
-    qb=False,
-    expert_bias=True,
+    qb=True,
+    expert_bias=False,
 ):
     keys = {
         "embedding.word_embeddings.weight",
@@ -87,7 +87,7 @@ def expected_fork_keys(
 
 def _mock_pair(sandwich, latent, qb, expert_bias, seed=0):
     model = megatron_mock.build_tiny_model(
-        sandwich, latent, qb, seed=seed, zero_expert_bias=not expert_bias
+        sandwich, latent, qb, seed=seed
     )
     tensors = megatron_mock.to_megatron_tensors(
         model, model.config, expert_bias_present=expert_bias
@@ -113,7 +113,7 @@ class TestKeySet:
         )
 
     def test_shapes_and_dtypes_latent_combo(self):
-        _, tensors = _mock_pair(True, TINY_LATENT, True, True)
+        _, tensors = _mock_pair(True, TINY_LATENT, True, False)
         H, D, F, E = TINY_HIDDEN, TINY_HEAD_DIM, TINY_MOE_INTERMEDIATE, TINY_N_EXPERTS
         qkv_rows = (TINY_HEADS + 2 * TINY_KV_HEADS) * D  # 64
         assert tensors["embedding.word_embeddings.weight"].shape == (TINY_VOCAB, H)
@@ -150,15 +150,13 @@ class TestKeySet:
         assert tensors["decoder.layers.1.mlp.shared_experts.linear_fc2.weight"].shape == (H, F)
         # fp32 buffers stay fp32 and non-trivial (randomized by the model factory)
         for L in (1, 2):
-            bias = tensors[f"decoder.layers.{L}.mlp.router.expert_bias"]
             beta = tensors[f"decoder.layers.{L}.mlp.router.qb_beta"]
-            assert bias.dtype == torch.float32 and bias.shape == (E,)
+            assert f"decoder.layers.{L}.mlp.router.expert_bias" not in tensors
             assert beta.dtype == torch.float32 and beta.shape == (E,)
-            assert bias.abs().sum() > 0, "factory must randomize expert_bias"
             assert beta.abs().sum() > 0, "factory must randomize qb_beta"
 
     def test_experts_in_dim_is_hidden_without_latent(self):
-        _, tensors = _mock_pair(False, None, False, True)
+        _, tensors = _mock_pair(False, None, True, False)
         assert tensors["decoder.layers.1.mlp.experts.experts.linear_fc1.weight"].shape == (
             TINY_N_EXPERTS,
             2 * TINY_MOE_INTERMEDIATE,
@@ -179,7 +177,7 @@ class TestKeySet:
 class TestMergeLayout:
     def test_qkv_merge_per_group_row_blocks(self):
         """Fused row order for heads=4, kv=2, D=8 must be q0 q1 k0 v0 | q2 q3 k1 v1."""
-        model, tensors = _mock_pair(False, None, False, True)
+        model, tensors = _mock_pair(False, None, True, False)
         state = model.state_dict()
         D = TINY_HEAD_DIM
         for L in range(TINY_LAYERS):
@@ -198,7 +196,7 @@ class TestMergeLayout:
         """Anchor the mock to the REAL on-disk per-expert layout: megatron fc1[e] must equal
         cat([gate_proj.{e}, up_proj.{e}], dim=0) of the tensors save_pretrained writes, and
         fc2[e] must equal down_proj.{e} — for dense mlp and shared expert likewise."""
-        model, tensors = _mock_pair(False, TINY_LATENT, False, True)
+        model, tensors = _mock_pair(False, TINY_LATENT, True, False)
         model.save_pretrained(str(tmp_path))
         disk = {}
         for path in sorted(glob.glob(os.path.join(str(tmp_path), "*.safetensors"))):
@@ -251,7 +249,7 @@ class TestMergeLayout:
             )
 
     def test_copies_are_decoupled_from_the_model(self):
-        model, tensors = _mock_pair(False, None, False, True)
+        model, tensors = _mock_pair(False, None, True, False)
         with torch.no_grad():
             model.model.embed_tokens.weight.add_(1.0)
         assert not torch.equal(
@@ -322,13 +320,13 @@ REQUIRED_ARGS_ATTRS = [
 class TestArgsNamespace:
     def test_every_contract_attr_present(self):
         config = megatron_mock.tiny_export_config(True, TINY_LATENT, True)
-        args = megatron_mock.make_args_namespace(config, expert_bias_present=True)
+        args = megatron_mock.make_args_namespace(config, expert_bias_present=False)
         missing = [a for a in REQUIRED_ARGS_ATTRS if not hasattr(args, a)]
         assert not missing, f"make_args_namespace missing contract attrs: {missing}"
 
     def test_fork_spellings_and_values(self):
-        config = megatron_mock.tiny_export_config(False, None, False)
-        args = megatron_mock.make_args_namespace(config, expert_bias_present=True)
+        config = megatron_mock.tiny_export_config(False, None, True)
+        args = megatron_mock.make_args_namespace(config, expert_bias_present=False)
         assert args.padded_vocab_size == TINY_VOCAB
         assert args.hidden_size == TINY_HIDDEN
         assert args.num_layers == TINY_LAYERS
@@ -343,7 +341,7 @@ class TestArgsNamespace:
         assert args.moe_shared_expert_intermediate_size == TINY_MOE_INTERMEDIATE  # n_shared 1
         assert args.moe_layer_freq == [0, 1, 1]  # [0]*k + [1]*(n-k), k == first_k_dense == 1
         assert args.moe_latent_size is None
-        assert args.moe_router_load_balancing_type == "aux_loss"  # scalar string when no QB
+        assert args.moe_router_load_balancing_type == ["seq_aux_loss", "quantile_balancing"]
         assert args.moe_router_topk_scaling_factor == 2.5
         assert args.layernorm_epsilon == 1e-5
         assert isinstance(args.rotary_base, int) and args.rotary_base == 500000
@@ -357,7 +355,7 @@ class TestArgsNamespace:
         assert args.moe_router_score_function == "sigmoid"
         assert args.softmax_type == "vanilla"
         assert args.mtp_num_layers is None
-        assert args.moe_router_enable_expert_bias is True
+        assert args.moe_router_enable_expert_bias is False
         assert args.moe_router_num_groups is None
         assert args.moe_router_group_topk is None
         assert args.moe_router_topk_limited_devices is None
@@ -371,13 +369,13 @@ class TestArgsNamespace:
 
     def test_qb_flag_switches_balancing_to_list(self):
         config = megatron_mock.tiny_export_config(False, None, True)
-        args = megatron_mock.make_args_namespace(config, expert_bias_present=True)
+        args = megatron_mock.make_args_namespace(config, expert_bias_present=False)
         assert args.moe_router_load_balancing_type == ["seq_aux_loss", "quantile_balancing"]
         # The config's canonical "sigmoid" score space maps back to the fork's estimator name.
         assert args.moe_router_quantile_balancing_method == "histogram"
 
     def test_expert_bias_and_overrides(self):
-        config = megatron_mock.tiny_export_config(False, None, False)
+        config = megatron_mock.tiny_export_config(False, None, True)
         args = megatron_mock.make_args_namespace(
             config, expert_bias_present=False, normalization="LayerNorm", bf16=True
         )
@@ -388,10 +386,10 @@ class TestArgsNamespace:
     def test_inexpressible_multiplier_is_rejected(self):
         # The production defaults do not match this tiny geometry.
         config = megatron_mock.tiny_export_config(
-            False, None, False, embedding_multiplier=27.712812921102035
+            False, None, True, embedding_multiplier=27.712812921102035
         )
         with pytest.raises(AssertionError, match="embedding_multiplier"):
-            megatron_mock.make_args_namespace(config, expert_bias_present=True)
+            megatron_mock.make_args_namespace(config, expert_bias_present=False)
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +401,8 @@ class TestSyntheticCheckpoint:
     def test_save_load_round_trip_bitwise(self, dist_env, tmp_path):
         import megatron.core.dist_checkpointing as dist_checkpointing
 
-        model, tensors = _mock_pair(True, TINY_LATENT, True, True)
-        args = megatron_mock.make_args_namespace(model.config, expert_bias_present=True)
+        model, tensors = _mock_pair(True, TINY_LATENT, True, False)
+        args = megatron_mock.make_args_namespace(model.config, expert_bias_present=False)
         ckpt_dir = tmp_path / "ckpt"
         megatron_mock.save_synthetic_checkpoint(tensors, args, ckpt_dir, iteration=100)
 
@@ -424,9 +422,9 @@ class TestSyntheticCheckpoint:
             assert torch.equal(loaded[key], reference), key
 
     def test_extra_tensors_are_injected(self, dist_env, tmp_path):
-        _, tensors = _mock_pair(False, None, False, True)
+        _, tensors = _mock_pair(False, None, True, False)
         args = megatron_mock.make_args_namespace(
-            megatron_mock.tiny_export_config(False, None, False), expert_bias_present=True
+            megatron_mock.tiny_export_config(False, None, True), expert_bias_present=False
         )
         extras = {
             "optimizer.state.exp_avg.decoder.layers.1.mlp.router.weight": torch.randn(8, 32),
@@ -439,13 +437,8 @@ class TestSyntheticCheckpoint:
         for key, reference in extras.items():
             assert torch.equal(loaded[key], reference), key
 
-    def test_expert_bias_absent_combo_omits_key_and_keeps_zeros(self):
-        model, tensors = _mock_pair(False, None, False, expert_bias=False)
+    def test_qb_checkpoint_contains_thresholds_without_correction_buffer(self):
+        model, tensors = _mock_pair(False, None, True, expert_bias=False)
         assert not any(key.endswith("router.expert_bias") for key in tensors)
-        assert not any(key.endswith("router.qb_beta") for key in tensors)
-        # the comparison target for the exporter's zero-synthesis path must BE zeros
-        for layer in model.model.layers[1:]:
-            assert torch.equal(
-                layer.mlp.gate.e_score_correction_bias,
-                torch.zeros_like(layer.mlp.gate.e_score_correction_bias),
-            )
+        assert any(key.endswith("router.qb_beta") for key in tensors)
+        assert not any("e_score_correction_bias" in key for key in model.state_dict())

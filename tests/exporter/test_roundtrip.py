@@ -44,7 +44,6 @@ def _build_and_save(
         latent,
         qb,
         seed=seed,
-        zero_expert_bias=not expert_bias,
         **model_overrides,
     )
     tensors = megatron_mock.to_megatron_tensors(
@@ -151,17 +150,9 @@ class TestRoundtrip:
         assert os.path.isfile(output_dir / "conversion_info.json")
         _assert_weight_files(output_dir)
 
-        if not expert_bias:
-            # zero-synthesis path: buffers exist, are fp32 zeros, and the synthesis is
-            # The choice is recorded in conversion_info.json.
-            for layer in reloaded.model.layers[1:]:
-                bias = layer.mlp.gate.e_score_correction_bias
-                assert bias.dtype == torch.float32
-                assert torch.equal(bias, torch.zeros_like(bias))
-            with open(output_dir / "conversion_info.json") as f:
-                assert "expert_bias" in f.read(), (
-                    "synthesized expert_bias keys should be recorded in conversion_info.json"
-                )
+        assert not any("e_score_correction_bias" in key for key in reloaded.state_dict())
+        with open(output_dir / "conversion_info.json") as f:
+            assert json.load(f)["synthesized_zero_keys"] == []
 
     def test_missing_source_qb_method_defaults_to_sigmoid_and_records_override(
         self, dist_env, export_api, tmp_path
@@ -225,7 +216,7 @@ class TestRoundtrip:
             sandwich=True,
             latent=24,
             qb=True,
-            expert_bias=True,
+            expert_bias=False,
             moe_layer_freq=pattern,
         )
         output_dir = tmp_path / "hf_interleaved"
@@ -261,7 +252,7 @@ class TestRoundtrip:
             sandwich=True,
             latent=24,
             qb=True,
-            expert_bias=True,
+            expert_bias=False,
             attention_output_gate=True,
         )
         output_dir = tmp_path / "hf_gated"
@@ -290,7 +281,7 @@ class TestRoundtrip:
         assert saved["attention_output_gate"] is True
 
     def test_output_dir_must_not_exist_or_be_empty(self, dist_env, export_api, tmp_path):
-        _, checkpoint_dir = _build_and_save(tmp_path, False, None, False, True)
+        _, checkpoint_dir = _build_and_save(tmp_path, False, None, True, False)
         output_dir = tmp_path / "occupied"
         output_dir.mkdir()
         sentinel = output_dir / "precious.txt"
@@ -301,7 +292,7 @@ class TestRoundtrip:
 
     def test_cli_subprocess_full_run(self, dist_env, tmp_path):
         """One combo (sandwich+latent+QB, the final-model shape) through the real CLI."""
-        model, checkpoint_dir = _build_and_save(tmp_path, True, 24, True, True)
+        model, checkpoint_dir = _build_and_save(tmp_path, True, 24, True, False)
         output_dir = tmp_path / "hf_cli"
         process = subprocess.run(
             [
