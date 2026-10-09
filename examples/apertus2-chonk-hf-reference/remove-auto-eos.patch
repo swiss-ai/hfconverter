@@ -1,0 +1,64 @@
+--- a/tokenizer.json
++++ b/tokenizer.json
+@@ -1156,12 +1156,6 @@
+           "id": "A",
+           "type_id": 0
+         }
+-      },
+-      {
+-        "SpecialToken": {
+-          "id": "</s>",
+-          "type_id": 0
+-        }
+       }
+     ],
+     "pair": [
+@@ -1179,12 +1173,6 @@
+       },
+       {
+         "SpecialToken": {
+-          "id": "</s>",
+-          "type_id": 0
+-        }
+-      },
+-      {
+-        "SpecialToken": {
+           "id": "<s>",
+           "type_id": 1
+         }
+@@ -1194,12 +1182,6 @@
+           "id": "B",
+           "type_id": 1
+         }
+-      },
+-      {
+-        "SpecialToken": {
+-          "id": "</s>",
+-          "type_id": 1
+-        }
+       }
+     ],
+     "special_tokens": {
+@@ -1000043,4 +1000025,4 @@
+       ]
+     ]
+   }
+-}
+\ No newline at end of file
++}
+--- a/tokenizer_config.json
++++ b/tokenizer_config.json
+@@ -1,5 +1,5 @@
+ {
+-  "add_bos_token": false,
++  "add_bos_token": true,
+   "add_eos_token": false,
+   "add_prefix_space": false,
+   "added_tokens_decoder": {
+@@ -1009,4 +1009,4 @@
+   "padding_side": "left",
+   "tokenizer_class": "PreTrainedTokenizerFast",
+   "unk_token": "<unk>"
+-}
+\ No newline at end of file
++}

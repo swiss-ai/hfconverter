@@ -1,9 +1,24 @@
-image = "/capstor/store/cscs/swissai/infra01/MLLM/containers/nvcr.io#nvidia+nemo+25.11.aarch64.sqsh"
+# User-selected NeMo-RL runtime (ARM64 / Alps GH200).
+# Tested Apertus2 Chonk exports and GLM-4.5 import; see README.md.
+image = "jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-7eab7fc435699b52c9668a663afde4b3"
 
-mounts = ["/capstor", "/iopsstor", "/users"]
+mounts = ["/capstor", "/iopsstor", "/ritom", "/users"]
 writable = true
 workdir = "/workspace"
 
 [annotations]
-com.hooks.aws_ofi_nccl.enabled = "true"
-com.hooks.aws_ofi_nccl.variant = "cuda12"
+# Extended Alps image already supplies its CUDA/NCCL/libfabric stack.
+com.hooks.cxi.enabled = "false"
+com.hooks.netstack.source = "host"
+
+[env]
+# Keep the image PATH: mounted login profiles can select a host Python instead.
+PATH = "/usr/local/lib/python3.12/dist-packages/torch_tensorrt/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin"
+# Do not use/download a host-managed Python through uv.
+UV_PYTHON_PREFERENCE = "only-system"
+UV_PYTHON_DOWNLOADS = "never"
+PYTHONNOUSERSITE = "1"
+PYTHONDONTWRITEBYTECODE = "1"
+HF_HUB_OFFLINE = "1"
+TRANSFORMERS_OFFLINE = "1"
+CUDA_DEVICE_MAX_CONNECTIONS = "1"
