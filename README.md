@@ -1,146 +1,198 @@
 # Apertus Checkpoint Converter
 
-Convert Megatron checkpoints to Hugging Face format. Compare native and HF logits.
+Convert checkpoints between Megatron and Hugging Face (HF).
 
 ## Megatron Bridge conversion
 
-Use `convert_bridge.sbatch` to export a Megatron checkpoint with Megatron Bridge.
+Use `convert_checkpoint.py` for both directions:
 
-Set the source-code paths before you submit a job. The launcher uses the
-container's Python and packages. Use `sinfo -a -o "%P %a"` to check the partitions.
+```bash
+uv run --no-project python convert_checkpoint.py import <hf-model-or-directory> <new-megatron-output>
+uv run --no-project python convert_checkpoint.py export <megatron-iteration> <hf-reference> <new-hf-output>
+```
 
-### Apertus2: Chonk
+Use `convert_bridge.sbatch` to run either command on Slurm. Set `BRIDGE_ROOT` and
+`MEGATRON_ROOT` to the compatible **source-code checkouts**, not checkpoint paths.
+The launcher uses the container's Python and packages from `nemo.toml`. Check the
+partition before submission with `sinfo -a -o "%P %a"`.
 
-Use [`examples/apertus2-chonk.sh`](examples/apertus2-chonk.sh) for the long-context
-checkpoint at iteration 3576. The script uses TP1/PP1/EP4/ETP1 on one GH200 node.
+`examples/convert.sh` is the shared launcher. It selects the model settings and
+submits `convert_bridge.sbatch`. The tested revisions below are its defaults.
+Set `BRIDGE_COMMIT` and `MEGATRON_COMMIT` to use other revisions, tags, or branches.
+Point the source roots at checkouts of those revisions; the launcher does not
+change your checkouts. For example:
 
-The script creates the HF reference in the run's scratch directory. It copies
-the config and configuration code from
+```bash
+export BRIDGE_COMMIT=<bridge-revision>
+export MEGATRON_COMMIT=<core-revision>
+bash examples/convert.sh apertus2-megachonk
+```
+
+The export modes are:
+
+- `config-only`: use a reference with config, tokenizer, and code, but no weights.
+  The converter streams weights into shards with a default target of 4 GiB.
+  Set `--max-shard-size-gib 16` for larger shards, or `MAX_SHARD_SIZE_GIB=16` with
+  the shared launcher. Larger targets use more RAM and produce fewer files.
+  This is not a total-memory limit; one tensor can exceed the target.
+- `weighted`: use a matching local HF checkpoint. Bridge checks its expected keys
+  and saves weights across the conversion ranks.
+
+`check_apertus2_export_keys.py` is a key-validation wrapper, not another converter.
+It supplies Apertus2's expected HF names to the generic converter for config-only
+export. It does not load or transform weights. Model-specific checks stay in this
+wrapper; model settings stay in the examples.
+
+### Apertus2 Chonk
+
+Run `bash examples/convert.sh apertus2-chonk` for the long-context
+checkpoint at iteration 3576. It uses TP1/PP1/EP4/ETP1 on one GH200 node.
+
+The script creates a config-only reference in scratch. It copies the config and
+configuration code from
 [`examples/apertus2-chonk-hf-reference`](examples/apertus2-chonk-hf-reference).
-It downloads the tokenizer from a fixed upstream revision. Then it applies the
-included patch to stop automatic `</s>` insertion. The patch does not change
-token IDs or remove the EOS token.
+It downloads the tokenizer at a fixed revision. The included patch stops automatic
+`</s>` insertion. It does not change token IDs or remove the EOS token.
 
-The default `config-only` mode needs no published HF model or reference weights.
-Use these source revisions:
+Tested with these source versions:
 
-- [Swiss AI Megatron-Bridge](https://github.com/swiss-ai/Megatron-Bridge):
-  `f3bc8e7e6a722adde1176b2ba8980109e09493ef`.
+- [Swiss AI Megatron-Bridge](https://github.com/swiss-ai/Megatron-Bridge), `apertus2/support`:
+  `6ccdb3c369491374f1fef4320886e8bb1394bb3e`.
 - [Megatron-LM-MoE PR #88](https://github.com/swiss-ai/Megatron-LM-MoE/pull/88):
-  `b0844260b2a0888c711dca230b88ec13b20f3229`.
+  `42e7a63aaf49e78e33ccfdd0373a423d198b9fb0`.
 
-The script checks both revisions. It sets Apertus2 Chonk's layout fields with
-`--model-override NAME=JSON`.
-
-`BRIDGE_ROOT` and `MEGATRON_ROOT` are **source-code paths**, not checkpoint paths.
-Set the checkpoint, reference, and output paths separately:
-
-- `CHECKPOINT`: the Megatron checkpoint iteration directory.
-- `HF_REFERENCE`: a matching HF checkpoint for `weighted` mode. For `config-only`
-  mode, use a directory with the config, tokenizer, and code, but no weights.
-- `HF_OUTPUT`: a new HF output directory. If you do not set it, the script uses
-  the run's scratch directory.
+The launcher checks the selected revisions. It sets the KDA fields with explicit
+`--model-override NAME=JSON` options.
 
 ```bash
 export BRIDGE_ROOT=/path/to/Megatron-Bridge
 export MEGATRON_ROOT=/path/to/Megatron-LM-MoE
 export CHECKPOINT=/path/to/megatron/iter_0003576
-bash examples/apertus2-chonk.sh  # Builds the config-only reference in scratch.
+bash examples/convert.sh apertus2-chonk
 
-# Optional: use a matching HF checkpoint that already has weights.
+# Optional: use a matching HF checkpoint with weights.
 export HF_REFERENCE=/path/to/matching/hf-checkpoint
-REFERENCE_MODE=weighted bash examples/apertus2-chonk.sh
+REFERENCE_MODE=weighted bash examples/convert.sh apertus2-chonk
 ```
 
-Each run creates an output under `$SCRATCH/tmp/apertus2-chonk-<mode>-export-*/hf`.
-Set `HF_OUTPUT` to use another output path. The default account is `csstaff`.
-The default partition is `normal`. Use `SLURM_ACCOUNT` and `SLURM_PARTITION` to
-change these settings.
+### Apertus2 Megachonk
 
-### GLM
+Run `bash examples/convert.sh apertus2-megachonk` for iteration
+8500 of `megachonk-muonmd-lr5.50e-3-mlr2.74e-2-latmoe-e256-top8-kda31-nope-megachonk`.
+It uses TP1/PP4/EP8/ETP1: 32 ranks across eight GH200 nodes. The pipeline
+layout is `Et*16|t*15|t*15|t*15L`. The example sets per-channel KDA decay and disables
+the legacy gate bias.
 
-Use [`examples/glm.sh`](examples/glm.sh) to import GLM-4.5 from HF to a saved
-Megatron checkpoint. This script does not export back to HF.
+The default config-only mode needs no published HF model or reference weights.
+The preparation script reuses the included Apertus2 configuration code and pinned
+tokenizer recipe, with the included Apertus2 Megachonk config.
 
-Use upstream NVIDIA Bridge and its specified Megatron Core revision.
-Do not use the Apertus2 Chonk fork for GLM. Initialize the `3rdparty/Megatron-LM`
-submodule first. TP8/PP1/EP16/ETP1 needs four GH200 nodes.
+Tested with these source versions:
 
-Set `HF_INPUT` to the local HF checkpoint. Set `MEGATRON_OUTPUT` to a new output
-directory. `BRIDGE_ROOT` is the Bridge source-code path.
+- Swiss AI Megatron-Bridge, `apertus2/support`:
+  `6ccdb3c369491374f1fef4320886e8bb1394bb3e`.
+- Megatron-LM-MoE PR #88:
+  `42e7a63aaf49e78e33ccfdd0373a423d198b9fb0`.
+
+```bash
+export BRIDGE_ROOT=/path/to/Megatron-Bridge
+export MEGATRON_ROOT=/path/to/Megatron-LM-MoE
+# CHECKPOINT defaults to the iteration 8500 source in the profile.
+export HF_OUTPUT=/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v2/hf/megachonk/pretraining/iter_0008500
+bash examples/convert.sh apertus2-megachonk
+
+# Optional weighted-reference mode.
+export HF_REFERENCE=/path/to/matching/hf-checkpoint
+REFERENCE_MODE=weighted bash examples/convert.sh apertus2-megachonk
+```
+
+This checkpoint uses Marin histogram quantile balancing. HF uses `legacy` for
+its raw-logit inference routing. To import it back for Marin training, set the
+training estimator and bin count explicitly, along with the uneven pipeline:
+
+```bash
+uv run --no-project python convert_checkpoint.py import "$HF_OUTPUT" /new/megatron/output \
+  --tp 1 --pp 4 --ep 8 --etp 1 --dtype bf16 --trust-remote-code \
+  --pipeline-layout 'Et*16|t*15|t*15|t*15L' \
+  --model-override 'moe_router_quantile_balancing_method="marin_histogram"' \
+  --model-override moe_router_quantile_balancing_marin_num_bins=10000
+```
+
+Pass these arguments through `convert_bridge.sbatch` for a distributed run.
+
+GH200 exposes HBM as host NUMA memory. CPU allocations must not consume the GPU's
+conversion headroom. The Apertus2 examples set `CPU_MEMORY_NODES=0,1,2,3` to keep
+CPU buffers in DDR on the tested Alps nodes. Check the NUMA layout before using
+this setting on other hardware.
+
+### Other models: GLM
+
+`bash examples/convert.sh glm` shows how to convert a **non-Apertus model**
+with Bridge. It imports GLM-4.5 from HF into a saved Megatron checkpoint. GLM
+export back to HF is outside this example's scope.
+
+The script uses the generic converter and launcher. No GLM import worker or
+model-specific Bridge patch is needed. For another supported model, select its
+compatible Bridge/Core revisions and change the HF input and parallelism.
+
+GLM was tested with upstream NVIDIA Bridge
+`bb46fee22aecc3ef0d8d083fff7eae79778d9fa8`, not the Apertus2 fork. This is the
+profile's default revision. Initialize its
+`3rdparty/Megatron-LM` submodule. TP8/PP1/EP16/ETP1 needs four GH200 nodes.
 
 ```bash
 export BRIDGE_ROOT=/path/to/NVIDIA-Megatron-Bridge
+bash examples/convert.sh glm
+
+# Or reuse a downloaded HF checkpoint.
 export HF_INPUT=/path/to/GLM-4.5-hf
 export MEGATRON_OUTPUT=/path/to/new/megatron-checkpoint
-bash examples/glm.sh
+bash examples/convert.sh glm
 ```
+
+The default input is `zai-org/GLM-4.5`, pinned to revision
+`cbb2c7cfb52fa128a9660cb1a7a78e017899e115`. Bridge downloads it through the HF
+library. Set `HF_INPUT` and `HF_REVISION` to use another model or revision. The
+shared HF cache stays on scratch, not in `$HOME`. GLM-4.5 needs about 668 GiB for
+the downloaded weights and additional space for the Megatron checkpoint.
 
 ### Conversion rules
 
-For Megatron → HF export:
-
-- Use a checkpoint iteration directory and a matching local HF reference.
-- The default is `--reference-mode config-only`. Do not include weights or
-  symlinks in this reference. The Apertus2 Chonk example creates this reference
-  from the included files. For `weighted` mode, set `HF_REFERENCE` explicitly.
-- Set `--tp`, `--pp`, `--ep`, and `--etp`. Use `PP * lcm(TP, ETP * EP)` ranks.
-- Use a new or empty output directory. Keep it separate from both inputs.
+- Use `PP * lcm(TP, ETP * EP)` ranks. Set `--tp`, `--pp`, `--ep`, and `--etp`.
+- Export needs a checkpoint iteration directory and a matching local HF reference.
+- A config-only reference must contain no weights, indexes, or symlinks.
+- Import accepts a local HF directory or an `owner/model` ID. Use `--hf-revision`
+  to pin a download.
+- Use a new or empty output directory. Keep it separate from the inputs.
 - `--trust-remote-code` runs reference code. Use it only with trusted files.
-- Use `RUN_ENV` to select another EDF. For options, run
-  `uv run python convert_megatron_to_hf.py --help`.
+- Generic config-only export can use `--expected-hf-index` or `--expected-hf-keys`
+  for complete key validation. Without a manifest, Bridge mapping errors and
+  duplicate keys are checked, but a missing HF output cannot be detected by name.
+- Each example writes under `$SCRATCH/tmp`. Set `HF_OUTPUT` or `MEGATRON_OUTPUT`
+  to use another durable output path.
+- Use `RUN_ENV`, `SLURM_ACCOUNT`, and `SLURM_PARTITION` to change the launch setup.
 
-### Test results
-
-Apertus2 Chonk passed these tests on one GH200 node with EP4 (job `5014485`):
-
-- Weighted HF export.
-- Config-only HF export.
-- HF → saved Megatron checkpoint → HF conversion.
-
-All 30,978 tensors matched exactly in each comparison. Tokenizer behavior and
-inference equivalence were not tested.
-
-GLM-4.5 HF → Megatron import completed on 16 GPUs (job `5014909`).
-The saved checkpoint contains the MTP parameters. GLM export back to HF, full
-tensor comparison, tokenizer behavior, and inference were not validated.
-
-### Tested versions
-
-Apertus2 Chonk used these versions and the source revisions listed above:
-
-| Component | Version |
-| --- | --- |
-| Swiss AI Megatron Bridge | `0.7.0+f3bc8e7e` |
-| Megatron Core, MoE PR #88 | `0.17.0rc0` (`b0844260b2a0888c711dca230b88ec13b20f3229`) |
-| Transformers | `5.17.0` |
-
-The tests used Python `3.12.3` and the NeMo-RL image in `nemo.toml`.
-These results apply only to the tested setup.
-
-GLM used upstream Bridge `0.7.0+bb46fee22`, Megatron Core `0.20.0+441a987`
-(`441a987409b8fdd2b90b463f7999bac970109a43`), and Transformers `5.17.0`.
-GLM import does not need a model-specific Bridge patch.
+For all options, run `uv run --no-project python convert_checkpoint.py --help`,
+then `import --help` or `export --help`.
 
 **Credit:** [Yixuan Xu (@Alvorecer721)](https://github.com/Alvorecer721)
 for the idea to use Megatron Bridge for conversion.
 
 ## Run the tests
 
-From the repository root, run:
-
 ```bash
 uv run --no-project --with pytest python -m pytest -q tests
 ```
 
-These tests use small temporary files. They do not use an existing checkpoint,
-load model weights, or need GPUs. They check input paths, reference modes, and
-HF weight-index consistency.
-
-To compare real HF checkpoints, use `tests/compare_hf_weights.py` separately.
-This comparison needs two existing HF checkpoints, PyTorch, and safetensors.
+These tests use small temporary files. They check input paths, CLI options,
+reference modes, and HF weight-index consistency. They do not convert weights or
+need GPUs. Use `tests/compare_hf_weights.py` separately to compare two real HF
+checkpoints. That comparison needs PyTorch and safetensors.
 
 ## Legacy conversion and logit checks
+
+The logit tools use the legacy setup. They need updates for the Bridge conversion
+path and are not part of this workflow.
 
 For legacy conversion, use `TP * PP` ranks:
 

@@ -1,9 +1,13 @@
 #!/bin/bash
-# Build the Apertus2 Chonk reference from its config and upstream tokenizer.
+# Build an Apertus2-family reference from a config, custom code, and pinned tokenizer.
 set -euo pipefail
 
 OUTPUT="${1:?Set a new reference output directory under scratch}"
+CONFIG_SOURCE="${2:-}"
 EXAMPLES="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "$CONFIG_SOURCE" ]]; then
+    [[ -f "$CONFIG_SOURCE/config.json" ]] || { echo "Missing config.json in $CONFIG_SOURCE" >&2; exit 2; }
+fi
 COMMIT=28ad57a2757f6f72edb0def57ee725b6812f2df3
 SOURCE="https://media.githubusercontent.com/media/swiss-ai/apertus-tokenizer-development/$COMMIT/preliminary_mul_200k"
 
@@ -12,7 +16,11 @@ SOURCE="https://media.githubusercontent.com/media/swiss-ai/apertus-tokenizer-dev
     exit 2
 }
 mkdir -p "$OUTPUT"
-cp "$EXAMPLES/apertus2-chonk-hf-reference/config.json" "$OUTPUT/"
+if [[ -n "$CONFIG_SOURCE" ]]; then
+    cp "$CONFIG_SOURCE/config.json" "$OUTPUT/"
+else
+    cp "$EXAMPLES/apertus2-chonk-hf-reference/config.json" "$OUTPUT/"
+fi
 cp "$EXAMPLES/apertus2-chonk-hf-reference/configuration_apertus2.py" "$OUTPUT/"
 
 for name in tokenizer.json tokenizer_config.json special_tokens_map.json; do

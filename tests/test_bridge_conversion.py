@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-import convert_megatron_to_hf as exporter
+import convert_checkpoint as exporter
 
 
 class ValidationTests(unittest.TestCase):
@@ -26,8 +27,136 @@ class ValidationTests(unittest.TestCase):
         (self.reference / "config.json").write_text("{}", encoding="utf-8")
 
     def test_default_reference_mode_is_config_only(self) -> None:
-        args = exporter._parser().parse_args(["checkpoint", "reference", "output"])
+        args = exporter._parser().parse_args(
+            ["export", "checkpoint", "reference", "output"]
+        )
         self.assertEqual(args.reference_mode, "config-only")
+        self.assertEqual(args.max_shard_size_gib, 4)
+
+    def test_streaming_shard_size(self) -> None:
+        argv = ["export", "checkpoint", "reference", "output", "--max-shard-size-gib"]
+        self.assertEqual(exporter._parser().parse_args([*argv, "16"]).max_shard_size_gib, 16)
+        for value in ("0", "-1", "nan", "1.5"):
+            with self.subTest(value=value), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                exporter._parser().parse_args([*argv, value])
+
+    def test_directional_cli_arguments(self) -> None:
+        imported = exporter._parser().parse_args(
+            [
+                "import",
+                "owner/model",
+                "output",
+                "--hf-revision",
+                "pinned-revision",
+                "--pipeline-layout",
+                "Et*16|t*15|t*15|t*15",
+                "--tp",
+                "2",
+                "--pp",
+                "3",
+                "--ep",
+                "4",
+                "--etp",
+                "2",
+                "--dtype",
+                "bf16",
+                "--trust-remote-code",
+                "--bridge-root",
+                "/bridge",
+                "--megatron-root",
+                "/megatron",
+            ]
+        )
+        self.assertEqual(imported.direction, "import")
+        self.assertEqual(imported.reference, "owner/model")
+        self.assertEqual(imported.hf_revision, "pinned-revision")
+        self.assertEqual(imported.pipeline_layout, "Et*16|t*15|t*15|t*15")
+        with mock.patch.dict(os.environ, {"WORLD_SIZE": "24"}):
+            self.assertEqual(exporter._validate_topology(imported), 24)
+        self.assertEqual(
+            (imported.tp, imported.pp, imported.ep, imported.etp), (2, 3, 4, 2)
+        )
+        self.assertTrue(imported.trust_remote_code)
+        exported = exporter._parser().parse_args(
+            [
+                "export",
+                "checkpoint",
+                "reference",
+                "output",
+                "--pipeline-layout",
+                "Et*2|t*2",
+            ]
+        )
+        self.assertEqual(exported.pipeline_layout, "Et*2|t*2")
+        self.assertEqual(exported.model_override, [])
+        imported_override = exporter._parser().parse_args(
+            ["import", "owner/model", "output", "--model-override", "foo=10000"]
+        )
+        self.assertEqual(imported_override.model_override, [("foo", 10000)])
+
+    def test_model_overrides_reject_unknown_and_topology_fields(self) -> None:
+        provider = mock.Mock(spec_set=["moe_router_quantile_balancing_method"])
+        with self.assertRaisesRegex(ValueError, "not supported by this provider"):
+            exporter._apply_model_overrides(provider, {"not_a_provider_field": True})
+        with self.assertRaisesRegex(ValueError, "topology/dtype"):
+            exporter._apply_model_overrides(provider, {"pipeline_model_parallel_size": 4})
+
+    def test_import_applies_explicit_layout_before_provider_finalize(self) -> None:
+        calls: list[str] = []
+        provider = mock.Mock()
+        provider.finalize.side_effect = lambda: calls.append(
+            (provider.pipeline_model_parallel_layout, provider.moe_router_quantile_balancing_method)
+        )
+        bridge = mock.Mock()
+        bridge.to_megatron_provider.return_value = provider
+        bridge._model_bridge = mock.Mock()
+        bridge._model_bridge.USE_MODEL_CONFIG_FOR_CONVERSION = False
+
+        backend = mock.Mock()
+        backend.import_checkpoint = mock.Mock()
+        backend._ensure_distributed_initialized = mock.Mock()
+        backend._prepare_distributed_output = mock.Mock()
+        backend._configure_model_provider = mock.Mock()
+        backend._uses_model_builder = mock.Mock(return_value=False)
+        backend._hf_tokenizer_kwargs = mock.Mock(return_value={})
+        bridge_module = mock.Mock()
+        bridge_module.AutoBridge.from_hf_pretrained.return_value = bridge
+        utils_module = mock.Mock()
+        utils_module.is_safe_repo.return_value = False
+        torch_module = mock.Mock()
+        torch_module.bfloat16 = object()
+        modules = {
+            "gpu_backend": backend,
+            "megatron": mock.Mock(),
+            "megatron.bridge": bridge_module,
+            "megatron.bridge.models": mock.Mock(),
+            "megatron.bridge.models.hf_pretrained": mock.Mock(),
+            "megatron.bridge.models.hf_pretrained.utils": utils_module,
+            "torch": torch_module,
+        }
+        args = exporter._parser().parse_args(
+            [
+                "import",
+                str(self.reference),
+                str(self.output),
+                "--pipeline-layout",
+                "Et*16|t*15|t*15|t*15",
+                "--model-override",
+                'moe_router_quantile_balancing_method="marin_histogram"',
+            ]
+        )
+        with (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(exporter, "_check_runtime_roots", return_value=(Path("/bridge"), Path("/megatron"))),
+        ):
+            exporter._run_import(args)
+
+        self.assertEqual(
+            calls,
+            [("Et*16|t*15|t*15|t*15", "marin_histogram")],
+        )
+        backend.import_checkpoint.assert_not_called()
+        bridge.save_megatron_model.assert_called_once()
 
     def test_config_only_reference_rejects_weights_and_symlinks(self) -> None:
         exporter._validate_reference(self.reference, "config-only")
@@ -76,7 +205,18 @@ class ValidationTests(unittest.TestCase):
 
     def test_launch_world_size_matches_topology(self) -> None:
         args = exporter._parser().parse_args(
-            ["checkpoint", "reference", "output", "--tp", "4", "--pp", "2", "--ep", "4"]
+            [
+                "export",
+                "checkpoint",
+                "reference",
+                "output",
+                "--tp",
+                "4",
+                "--pp",
+                "2",
+                "--ep",
+                "4",
+            ]
         )
         with mock.patch.dict(os.environ, {"WORLD_SIZE": "8"}):
             self.assertEqual(exporter._validate_topology(args), 8)
