@@ -1,0 +1,89 @@
+diff --git a/src/megatron/bridge/models/apertus/apertus_bridge.py b/src/megatron/bridge/models/apertus/apertus_bridge.py
+index f183e5a0..470b9e59 100644
+--- a/src/megatron/bridge/models/apertus/apertus_bridge.py
++++ b/src/megatron/bridge/models/apertus/apertus_bridge.py
+@@ -34,7 +34,7 @@ from megatron.bridge.models.conversion.param_mapping import (
+     QKVMapping,
+ )
+ from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+-from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider
++from megatron.bridge.models.apertus.apertus_provider import ApertusModelProvider, XIELU
+ 
+ # Apertus uses a custom model class that requires trust_remote_code
+ # We register by model name string to avoid loading the model at import time
+@@ -64,10 +64,8 @@ class ApertusBridge(MegatronModelBridge):
+     def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> ApertusModelProvider:
+         hf_config = hf_pretrained.config
+ 
+-        # Get RoPE scale factor from config
+-        scale_factor = 8.0  # default
+-        if getattr(hf_config, "rope_scaling", None) is not None:
+-            scale_factor = hf_config.rope_scaling.get("factor", 8.0)
++        rope = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
++        scale_factor = rope.get("factor", 8.0)
+ 
+         # Extract kv_channels from head_dim if present
+         kv_channels = getattr(hf_config, "head_dim", None)
+@@ -81,7 +79,7 @@ class ApertusBridge(MegatronModelBridge):
+             layernorm_epsilon=hf_config.rms_norm_eps,
+             num_query_groups=hf_config.num_key_value_heads,
+             seq_length=hf_config.max_position_embeddings,
+-            rotary_base=hf_config.rope_theta,
++            rotary_base=getattr(hf_config, "rope_theta", rope.get("rope_theta", 10000.0)),
+             kv_channels=kv_channels,
+             gated_linear_unit=False,  # Apertus uses XIELU, NOT gated MLP
+             # Apertus-specific: QK normalization
+@@ -99,6 +97,44 @@ class ApertusBridge(MegatronModelBridge):
+ 
+         return provider
+ 
++    @classmethod
++    def megatron_to_hf_config(cls, provider):
++        return {
++            "num_hidden_layers": provider.num_layers,
++            "hidden_size": provider.hidden_size,
++            "intermediate_size": provider.ffn_hidden_size,
++            "num_attention_heads": provider.num_attention_heads,
++            "num_key_value_heads": provider.num_query_groups,
++            "head_dim": provider.kv_channels,
++            "vocab_size": provider.vocab_size,
++            "rms_norm_eps": provider.layernorm_epsilon,
++            "initializer_range": provider.init_method_std,
++            "max_position_embeddings": provider.seq_length,
++            "qk_norm": provider.qk_layernorm,
++            "tie_word_embeddings": provider.share_embeddings_and_output_weights,
++            "rope_theta": provider.rotary_base,
++            "rope_scaling": {"factor": provider.scale_factor, "rope_type": "llama3"},
++        }
++
++    def build_conversion_tasks(self, hf_pretrained, megatron_model, weight_dtype=None):
++        buffer_names = ("beta", "eps")
++        # HF persists these fixed activation constants; MCore stores attributes.
++        for chunk in megatron_model:
++            for module in chunk.modules():
++                if not isinstance(module, XIELU):
++                    continue
++                for name in buffer_names:
++                    if name in module._buffers:
++                        continue
++                    value = torch.as_tensor(
++                        getattr(module, name),
++                        dtype=module.alpha_p.dtype,
++                        device=module.alpha_p.device,
++                    ).reshape(())
++                    delattr(module, name)
++                    module.register_buffer(name, value)
++        return super().build_conversion_tasks(hf_pretrained, megatron_model, weight_dtype=weight_dtype)
++
+     def mapping_registry(self) -> MegatronMappingRegistry:
+         """Return parameter mappings from Megatron to HF format.
+ 
+@@ -147,6 +183,8 @@ class ApertusBridge(MegatronModelBridge):
+             # XIELU activation parameters (Apertus-specific)
+             "decoder.layers.*.mlp.activation_func.alpha_p": "model.layers.*.mlp.act_fn.alpha_p",
+             "decoder.layers.*.mlp.activation_func.alpha_n": "model.layers.*.mlp.act_fn.alpha_n",
++            "decoder.layers.*.mlp.activation_func.beta": "model.layers.*.mlp.act_fn.beta",
++            "decoder.layers.*.mlp.activation_func.eps": "model.layers.*.mlp.act_fn.eps",
+         }
+ 
+         mapping_list = []

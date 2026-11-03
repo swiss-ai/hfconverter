@@ -184,15 +184,43 @@ for the idea to use Megatron Bridge for conversion.
 uv run --no-project --with pytest python -m pytest -q tests
 ```
 
-These tests use small temporary files. They check input paths, CLI options,
-reference modes, and HF weight-index consistency. They do not convert weights or
-need GPUs. Use `tests/compare_hf_weights.py` separately to compare two real HF
+The default run checks input paths, CLI options, reference modes, and HF
+weight-index consistency using small temporary files. GPU integration tests are
+skipped unless `HFCONVERTER_RUN_PARITY=1`.
+
+### Fixed checkpoint fixtures
+
+`tests/test_apertus_parity.py` always reads these Capstor fixtures. It converts
+native weights into a fresh scratch directory, then checks every exported tensor
+against the fixed HF reference, including shape and dtype. Inputs must be mounted
+read-only; the tests also check that their file trees remain unchanged.
+
+| Test | Native checkpoint | HF reference |
+|---|---|---|
+| Apertus 1.5, 8B, iteration 4200 | `/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v1p5/megatron/8B/posttraining/longctx_iter_0004200` | `/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v1p5/hf/8B/posttraining/longctx_iter_0004200` |
+| Apertus 2, Chonk, iteration 3576 | `/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v2/megatron/chonk/pretraining/long_context/iter_0003576` | `/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v2/hf/chonk/pretraining/long_context/long-context-iter-0003576` |
+
+Apertus 1.5 also checks effective model configuration and FP32 last-token logits
+against both fixed HF and native models. Apertus 2 currently checks full tensor
+parity, not logit parity. It needs four GPUs on one node (EP4).
+
+Run each case in the GPU container with its matching `BRIDGE_ROOT` and
+`MEGATRON_ROOT` source checkouts. Use the container interpreter with PyTorch,
+safetensors and pytest installed. Set `HFCONVERTER_TEST_TMP` to an Iopsstor or
+Ritom directory under `tmp` for outputs.
+
+```bash
+HFCONVERTER_RUN_PARITY=1 uv run --no-project --python /usr/bin/python3.12 python -m pytest -q tests/test_apertus_parity.py -k apertus15
+HFCONVERTER_RUN_PARITY=1 uv run --no-project --python /usr/bin/python3.12 python -m pytest -q tests/test_apertus_parity.py -k apertus2
+```
+
+Use `tests/compare_hf_weights.py` separately to compare two existing HF
 checkpoints. That comparison needs PyTorch and safetensors.
 
 ## Legacy conversion and logit checks
 
-The logit tools use the legacy setup. They need updates for the Bridge conversion
-path and are not part of this workflow.
+The native logit tool targets legacy GPT checkpoints and is used by the Apertus
+1.5 integration test. Apertus 2 KDA logit parity is not implemented.
 
 For legacy conversion, use `TP * PP` ranks:
 
