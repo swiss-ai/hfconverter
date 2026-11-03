@@ -43,6 +43,43 @@ It supplies Apertus2's expected HF names to the generic converter for config-onl
 export. It does not load or transform weights. Model-specific checks stay in this
 wrapper; model settings stay in the examples.
 
+### Apertus 1.5
+
+Run `bash examples/convert.sh apertus15` for the 8B posttraining checkpoint at
+iteration 4200. It uses TP1/PP1/EP1/ETP1 on one GH200 node and the same converter
+API, CLI and `nemo.toml` runtime as the other examples.
+
+Source versions:
+
+- [Alvorecer721/Megatron-Bridge](https://github.com/Alvorecer721/Megatron-Bridge),
+  `yxu/apertus-conversion`: `04fd01023d852f73ea35f79a6fa6d683500bc64c`.
+- [Swiss AI Megatron-LM](https://github.com/swiss-ai/Megatron-LM):
+  `04edde000b189470836d6fe85cda9a9f3c0b3161`.
+
+Apply the four tracked patches in `patches/apertus15/` to a new scratch Bridge
+worktree at the commit above, not to the original checkout. They adapt the
+branch's own native checkpoint loader and conversion API to the selected Core.
+
+```bash
+export BRIDGE_ROOT="$SCRATCH/tmp/apertus15-bridge"
+git -C /path/to/Alvorecer721-Megatron-Bridge worktree add --detach "$BRIDGE_ROOT" \
+  04fd01023d852f73ea35f79a6fa6d683500bc64c
+git -C "$BRIDGE_ROOT" apply --check "$PWD"/patches/apertus15/*.patch && \
+  git -C "$BRIDGE_ROOT" apply "$PWD"/patches/apertus15/*.patch
+export MEGATRON_ROOT=/path/to/compatible/Megatron-LM
+# CHECKPOINT defaults to the fixed iteration 4200 native fixture below.
+bash examples/convert.sh apertus15
+
+# Optional: use a matching HF checkpoint with weights.
+export HF_REFERENCE=/path/to/matching/hf-checkpoint
+REFERENCE_MODE=weighted bash examples/convert.sh apertus15
+```
+
+The default config-only mode copies config/tokenizer assets from the fixed
+Capstor HF reference into scratch; it does not copy weights or change the source.
+Set `CHECKPOINT`, `HF_REFERENCE` and `HF_OUTPUT` to select other compatible inputs
+and a new output directory.
+
 ### Apertus2 Chonk
 
 Run `bash examples/convert.sh apertus2-chonk` for the long-context
