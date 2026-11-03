@@ -26,11 +26,10 @@ def _sha256(data: bytes) -> str:
 def resolve_output_paths(out_pt_arg: str, out_report_arg: str, file_prefix: str):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_results_dir = os.path.join(script_dir, "results")
-    os.makedirs(default_results_dir, exist_ok=True)
-
     if out_pt_arg:
         out_pt = out_pt_arg
     else:
+        os.makedirs(default_results_dir, exist_ok=True)
         out_pt = os.path.join(default_results_dir, f"{file_prefix}.pt")
 
     if out_report_arg:
@@ -182,6 +181,7 @@ def extra_args(parser):
     group.add_argument("--prompt", type=str, required=True)
     group.add_argument("--out-pt", type=str, default="")
     group.add_argument("--out-report", type=str, default="")
+    group.add_argument("--inference-dtype", choices=("checkpoint", "fp32"), default="checkpoint")
     return parser
 
 
@@ -198,6 +198,12 @@ def main():
     )
 
     args = get_args()
+    if args.inference_dtype == "fp32":
+        args.bf16 = False
+        args.fp16 = False
+        args.params_dtype = torch.float32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     patch_te_set_extra_state_eof()
 
@@ -233,6 +239,7 @@ def main():
         report["megatron_checkpoint_path"] = os.path.abspath(args.load)
         report["checkpoint_iteration"] = iter_tag_raw
         report["mode"] = "native_dist"
+        report["inference_dtype"] = str(args.params_dtype)
         report["timestamp_utc"] = timestamp
         report["padded_num_prompt_tokens"] = int(len(padded_token_ids))
         report["tensor_model_parallel_size"] = int(mpu.get_tensor_model_parallel_world_size())

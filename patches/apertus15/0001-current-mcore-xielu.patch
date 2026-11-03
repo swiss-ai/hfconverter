@@ -1,0 +1,12 @@
+diff --git a/src/megatron/bridge/models/apertus/apertus_provider.py b/src/megatron/bridge/models/apertus/apertus_provider.py
+--- a/src/megatron/bridge/models/apertus/apertus_provider.py
++++ b/src/megatron/bridge/models/apertus/apertus_provider.py
+@@ -29,7 +29,7 @@ from megatron.bridge.models.gpt_provider import GPTModelProvider
+ 
+ # Import XIELU - works with both stock megatron-lm and Swiss AI Megatron-LM
+ try:
+-    from megatron.training.activations import XIELU
++    from megatron.core.activations import XIELU
+     HAS_XIELU = True
+ except ImportError:
+     HAS_XIELU = False

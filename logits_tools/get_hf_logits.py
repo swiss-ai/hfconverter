@@ -46,11 +46,10 @@ def parse_args():
 def resolve_output_paths(out_pt_arg: str, out_report_arg: str, file_prefix: str):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     default_results_dir = os.path.join(script_dir, "results")
-    os.makedirs(default_results_dir, exist_ok=True)
-
     if out_pt_arg:
         out_pt = out_pt_arg
     else:
+        os.makedirs(default_results_dir, exist_ok=True)
         out_pt = os.path.join(default_results_dir, f"{file_prefix}.pt")
 
     if out_report_arg:

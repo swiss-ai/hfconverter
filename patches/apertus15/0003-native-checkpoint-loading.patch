@@ -1,0 +1,188 @@
+diff --git a/src/megatron/bridge/training/checkpointing.py b/src/megatron/bridge/training/checkpointing.py
+index 316a7d15..9a0e8929 100644
+--- a/src/megatron/bridge/training/checkpointing.py
++++ b/src/megatron/bridge/training/checkpointing.py
+@@ -44,7 +44,12 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+ from megatron.core.msc_utils import MultiStorageClientFeature
+ from megatron.core.num_microbatches_calculator import update_num_microbatches
+ from megatron.core.optimizer import DistributedOptimizer, MegatronOptimizer
+-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
++try:
++    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
++except ModuleNotFoundError as error:
++    if error.name != "megatron.core.optimizer.layer_wise_optimizer":
++        raise
++    LayerWiseDistributedOptimizer = None
+ from megatron.core.rerun_state_machine import get_rerun_state_machine
+ from megatron.core.transformer import MegatronModule
+ from megatron.core.utils import unwrap_model
+@@ -525,7 +530,7 @@ def save_checkpoint(
+     maybe_save_dataloader_state(train_data_iterator, train_state.step, getattr(cfg.dataset, "dataloader_save", None))
+ 
+     # Save LayerWiseDistributedOptimizer
+-    if isinstance(
++    if LayerWiseDistributedOptimizer is not None and isinstance(
+         optimizer, LayerWiseDistributedOptimizer
+     ):  # replacement of getattr(args, "optimizer", "adam").startswith("dist_")
+         dp_rank = mpu.get_data_parallel_rank()
+@@ -1580,7 +1585,11 @@ def _load_checkpoint_from_path(
+     # Load optimizer and scheduler
+     if not release and not cfg.checkpoint.finetune and cfg.checkpoint.load_optim:
+         try:
+-            if isinstance(optimizer, LayerWiseDistributedOptimizer) and cfg.checkpoint.ckpt_format == "torch":
++            if (
++                LayerWiseDistributedOptimizer is not None
++                and isinstance(optimizer, LayerWiseDistributedOptimizer)
++                and cfg.checkpoint.ckpt_format == "torch"
++            ):
+                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
+                 dp_rank = mpu.get_data_parallel_rank()
+                 optim_checkpoint_name = os.path.join(
+diff --git a/src/megatron/bridge/training/mlm_compat/arguments.py b/src/megatron/bridge/training/mlm_compat/arguments.py
+index 4c0cd1da..91ea0c1e 100644
+--- a/src/megatron/bridge/training/mlm_compat/arguments.py
++++ b/src/megatron/bridge/training/mlm_compat/arguments.py
+@@ -81,6 +81,12 @@ def _transformer_config_from_args(
+     if args.squared_relu:
+         assert not args.swiglu
+         kw_args["activation_func"] = squared_relu
++    if getattr(args, "xielu", False):
++        from megatron.core.activations import XIELU
++
++        kw_args["activation_func"] = XIELU
++        kw_args["gated_linear_unit"] = False
++        kw_args["bias_activation_fusion"] = False
+     if args.init_method_xavier_uniform:
+         kw_args["init_method"] = torch.nn.init.xavier_uniform_
+     if args.group_query_attention:
+@@ -104,5 +110,14 @@ def _transformer_config_from_args(
+         kw_args["use_kitchen"] = True
+         kw_args["quant_recipe"] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+ 
++    provider_fields = {field.name for field in dataclasses.fields(config_class)}
++    provider_values = {
++        "vocab_size": getattr(args, "padded_vocab_size", None),
++        "seq_length": args.max_position_embeddings,
++        "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
++        "scale_factor": args.rope_scaling_factor if args.use_rope_scaling else 1.0,
++    }
++    kw_args.update({name: value for name, value in provider_values.items() if name in provider_fields})
++
+     # Return config.
+     return config_class(**kw_args)
+diff --git a/src/megatron/bridge/training/mlm_compat/model.py b/src/megatron/bridge/training/mlm_compat/model.py
+index 7bd088c4..31060bc9 100644
+--- a/src/megatron/bridge/training/mlm_compat/model.py
++++ b/src/megatron/bridge/training/mlm_compat/model.py
+@@ -50,13 +50,14 @@ def _get_transformer_layer_spec(args: argparse.Namespace, use_te: bool, use_kitc
+     Returns:
+         transformer_layer_spec: The transformer layer specification
+     """
++    if getattr(args, "experimental_attention_variant", None) is not None:
++        raise ValueError("Experimental attention is not supported by the pinned Megatron Core")
+     if use_te:
+         return get_gpt_layer_with_transformer_engine_spec(
+             num_experts=args.num_experts,
+             moe_grouped_gemm=args.moe_grouped_gemm,
+             qk_layernorm=args.qk_layernorm,
+             multi_latent_attention=args.multi_latent_attention,
+-            experimental_attention_variant=getattr(args, "experimental_attention_variant", None),
+             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+             qk_l2_norm=args.qk_l2_norm,
+             use_kitchen=use_kitchen,
+@@ -67,7 +68,6 @@ def _get_transformer_layer_spec(args: argparse.Namespace, use_te: bool, use_kitc
+             moe_grouped_gemm=args.moe_grouped_gemm,
+             qk_layernorm=args.qk_layernorm,
+             multi_latent_attention=args.multi_latent_attention,
+-            experimental_attention_variant=getattr(args, "experimental_attention_variant", None),
+             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+             normalization=args.normalization,
+             use_kitchen=use_kitchen,
+@@ -131,6 +131,7 @@ def _gpt_provider(
+         rotary_percent=args.rotary_percent,
+         rotary_base=args.rotary_base,
+         rope_scaling=args.use_rope_scaling,
++        rope_scaling_factor=args.rope_scaling_factor if args.use_rope_scaling else 1.0,
+         mtp_block_spec=mtp_block_spec,
+         vp_stage=vp_stage,
+     )
+diff --git a/src/megatron/bridge/training/model_load_save.py b/src/megatron/bridge/training/model_load_save.py
+index cef9487b..a88c0ec3 100644
+--- a/src/megatron/bridge/training/model_load_save.py
++++ b/src/megatron/bridge/training/model_load_save.py
+@@ -276,10 +276,10 @@ def build_and_load_model(
+             assert model_type in ("gpt", "mamba"), f"model type {model_type} not supported."
+             assert megatron_args is not None, "megatron_args must be provided if the checkpoint is from MegatronLM."
+ 
+-            # Generate the unpadded vocab size based on the tokenizer from the checkpoint
++            # Retain checkpoint rows when repadding for the runtime TP size.
+             cfg = _tokenizer_config_from_args(megatron_args)
+             tokenizer = build_tokenizer(cfg)
+-            vocab_size = tokenizer.vocab_size
++            vocab_size = max(tokenizer.vocab_size, getattr(megatron_args, "padded_vocab_size", 0) or 0)
+ 
+             # Re-calculate the padded vocab size based on the model config instead of the args from the checkpoint
+             # to accommodate TP overrides
+@@ -340,6 +340,7 @@ def load_megatron_model(
+     use_cpu_init: bool = False,
+     skip_temp_dist_context: Optional[bool] = None,
+     mp_overrides: Optional[ModelParallelKwargs] = None,
++    tokenizer_model: Optional[str] = None,
+ ) -> Union[Any, dict[str, torch.Tensor]]:
+     """Load a Megatron model from a distributed checkpoint.
+ 
+@@ -358,12 +359,15 @@ def load_megatron_model(
+                                Default: None.
+         mp_overrides: Optional model-parallel overrides to apply to the loaded config.
+                       Only provided fields are overridden.
++        tokenizer_model: Override the tokenizer path stored in native checkpoint arguments.
+ 
+     Returns:
+         The model instance with loaded weights if return_state_dict is False,
+         otherwise returns a dictionary containing the full, unsharded model state_dict.
+     """
+     model_cfg, mlm_args = load_model_config(checkpoint_path)
++    if mlm_args is not None and tokenizer_model is not None:
++        mlm_args.tokenizer_model = tokenizer_model
+     # If in single GPU environment, reset additional parallel settings
+     model_cfg.tensor_model_parallel_size = 1
+     model_cfg.pipeline_model_parallel_size = 1
+@@ -387,6 +391,13 @@ def load_megatron_model(
+             if hasattr(model_cfg, key) and value is not None:
+                 setattr(model_cfg, key, value)
+ 
++    if mp_overrides and mp_overrides.get("params_dtype") is not None:
++        model_cfg.bf16 = model_cfg.params_dtype == torch.bfloat16
++        model_cfg.fp16 = model_cfg.params_dtype == torch.float16
++    if mlm_args is not None:
++        for name in ("bf16", "fp16", "params_dtype"):
++            setattr(mlm_args, name, getattr(model_cfg, name))
++
+     return build_and_load_model(
+         checkpoint_path, model_cfg, model_type, mlm_args, return_state_dict, use_cpu_init, skip_temp_dist_context
+     )
+@@ -397,6 +408,8 @@ def save_megatron_model(
+     path: Union[str, Path],
+     ckpt_format: str = "torch_dist",
+     hf_tokenizer_path: Optional[Union[str, Path]] = None,
++    hf_tokenizer_kwargs: Optional[dict] = None,
++    low_memory_save: bool = False,
+ ) -> None:
+     """Save a Megatron model in native Megatron checkpoint format without optimizer state.
+ 
+@@ -436,8 +449,15 @@ def save_megatron_model(
+         tokenizer_config = TokenizerConfig(
+             tokenizer_type="HuggingFaceTokenizer",
+             tokenizer_model=str(hf_tokenizer_path),
++            hf_tokenizer_kwargs=hf_tokenizer_kwargs or {},
+         )
+ 
++    # Low-memory saves leave model shards on CPU to avoid GPU factory copies.
++    if low_memory_save:
++        for chunk in model:
++            chunk.cpu()
++        torch.cuda.empty_cache()
++
+     # Get model config from the first model instance
+     model_config = get_model_config(model[0])
+ 
