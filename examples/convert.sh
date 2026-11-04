@@ -3,14 +3,27 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 <apertus2-chonk|apertus2-megachonk|glm>" >&2
+    echo "Usage: $0 <apertus15|apertus2-chonk|apertus2-megachonk|glm>" >&2
 }
 
 if (( $# != 1 )); then usage; exit 2; fi
 PROFILE="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+TASKS_PER_NODE=4
 case "$PROFILE" in
+    apertus15)
+        KIND=export
+        BRIDGE_COMMIT="${BRIDGE_COMMIT:-04fd01023d852f73ea35f79a6fa6d683500bc64c}"
+        MEGATRON_COMMIT="${MEGATRON_COMMIT:-04edde000b189470836d6fe85cda9a9f3c0b3161}"
+        : "${BRIDGE_ROOT:?Set BRIDGE_ROOT to the patched Apertus Megatron-Bridge checkout}"
+        : "${MEGATRON_ROOT:?Set MEGATRON_ROOT to the compatible Megatron-LM checkout}"
+        CHECKPOINT="${CHECKPOINT:-/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v1p5/megatron/8B/posttraining/longctx_iter_0004200}"
+        REFERENCE_SOURCE=/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v1p5/hf/8B/posttraining/longctx_iter_0004200
+        REFERENCE_MODE="${REFERENCE_MODE:-config-only}"
+        MODEL_ARGS=(--tp 1 --pp 1 --ep 1 --etp 1 --dtype bf16 --reference-mode "$REFERENCE_MODE")
+        NODES=1; WORLD=1; TASKS_PER_NODE=1; JOB_TIME="${SLURM_TIME:-01:00:00}"
+        ;;
     apertus2-chonk)
         KIND=export
         BRIDGE_COMMIT="${BRIDGE_COMMIT:-6ccdb3c369491374f1fef4320886e8bb1394bb3e}"
@@ -82,8 +95,18 @@ if [[ "$KIND" == export ]]; then
         config-only)
             if [[ -z "${HF_REFERENCE:-}" ]]; then
                 HF_REFERENCE="$SESSION/reference"
-                bash "$ROOT/examples/prepare_apertus2_reference.sh" \
-                    "$HF_REFERENCE" "$ROOT/examples/${PROFILE}-hf-reference"
+                if [[ "$PROFILE" == apertus15 ]]; then
+                    [[ -f "$REFERENCE_SOURCE/config.json" ]] || { echo "Missing config.json in $REFERENCE_SOURCE" >&2; exit 2; }
+                    mkdir -p "$HF_REFERENCE"
+                    for asset in "$REFERENCE_SOURCE"/*; do
+                        [[ -f "$asset" ]] || continue
+                        case "$asset" in *.safetensors|*.bin|*.index.json) continue ;; esac
+                        cp "$asset" "$HF_REFERENCE/"
+                    done
+                else
+                    bash "$ROOT/examples/prepare_apertus2_reference.sh" \
+                        "$HF_REFERENCE" "$ROOT/examples/${PROFILE}-hf-reference"
+                fi
             fi
             ;;
         weighted) : "${HF_REFERENCE:?Set HF_REFERENCE to a matching weighted Apertus2 HF checkpoint}" ;;
@@ -105,7 +128,7 @@ printf 'Source profile: %s\nLog: %s/%s-%%j.log\n' "$PROFILE" "$SESSION" "$KIND"
 sbatch \
     --account="$SLURM_ACCOUNT" \
     --partition="$SLURM_PARTITION" \
-    --nodes="$NODES" --ntasks="$WORLD" --ntasks-per-node=4 --gpus-per-node=4 \
+    --nodes="$NODES" --ntasks="$WORLD" --ntasks-per-node="$TASKS_PER_NODE" --gpus-per-node=4 \
     --cpus-per-task=72 --time="$JOB_TIME" \
     --output="$SESSION/$KIND-%j.log" \
     "$ROOT/convert_bridge.sbatch" "${args[@]}"
