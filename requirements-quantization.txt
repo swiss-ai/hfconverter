@@ -1,0 +1,4 @@
+# Optional HF-to-HF quantization. These pure-Python packages also support a
+# --no-deps scratch overlay on the repository's tested nemo.toml runtime.
+llmcompressor==0.15.0
+compressed-tensors==0.20.1
