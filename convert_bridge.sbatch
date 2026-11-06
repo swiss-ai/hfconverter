@@ -11,23 +11,36 @@
 
 set -euo pipefail
 
-if (( $# < 1 )) || [[ "$1" != import && "$1" != export ]]; then
-    echo "Usage: sbatch convert_bridge.sbatch {import|export} <converter positional arguments> [converter options]" >&2
+if (( $# < 1 )) || [[ "$1" != import && "$1" != export && "$1" != quantize ]]; then
+    echo "Usage: sbatch convert_bridge.sbatch {import|export|quantize} <converter positional arguments> [converter options]" >&2
     exit 2
 fi
 : "${SCRATCH:?Set SCRATCH to shared scratch storage}"
-: "${MEGATRON_ROOT:?Set MEGATRON_ROOT to a checkpoint-compatible checkout}"
-: "${BRIDGE_ROOT:?Set BRIDGE_ROOT to the Megatron Bridge checkout}"
+if [[ "$1" != quantize ]]; then
+    : "${MEGATRON_ROOT:?Set MEGATRON_ROOT to a checkpoint-compatible checkout}"
+    : "${BRIDGE_ROOT:?Set BRIDGE_ROOT to the Megatron Bridge checkout}"
+fi
+
+MEGATRON_ROOT="${MEGATRON_ROOT:-}"
+BRIDGE_ROOT="${BRIDGE_ROOT:-}"
 
 HFCONVERTER_ROOT="${LOCAL_HFCONVERTER_PATH:-${SLURM_SUBMIT_DIR}}"
 RUN_ENV="${RUN_ENV:-$HFCONVERTER_ROOT/nemo.toml}"
 CONVERTER_SCRIPT="${CONVERTER_SCRIPT:-$HFCONVERTER_ROOT/convert_checkpoint.py}"
-for path in \
-    "$RUN_ENV" \
-    "$CONVERTER_SCRIPT" \
-    "$MEGATRON_ROOT/megatron/core/__init__.py" \
-    "$BRIDGE_ROOT/src/megatron/bridge/__init__.py"
-do
+required_paths=("$RUN_ENV" "$CONVERTER_SCRIPT")
+source_roots=("$HFCONVERTER_ROOT")
+step_args=()
+if [[ "$1" == quantize ]]; then
+    step_args=(--nodes=1 --ntasks=1 --ntasks-per-node=1)
+else
+    required_paths+=(
+        "$MEGATRON_ROOT/megatron/core/__init__.py"
+        "$BRIDGE_ROOT/src/megatron/bridge/__init__.py"
+    )
+    source_roots+=("$MEGATRON_ROOT" "$BRIDGE_ROOT")
+fi
+
+for path in "${required_paths[@]}"; do
     if [[ ! -f "$path" ]]; then
         echo "Missing required file: $path" >&2
         exit 2
@@ -40,12 +53,12 @@ export HFCONVERTER_ROOT MEGATRON_ROOT BRIDGE_ROOT SESSION_DIR CONVERTER_SCRIPT
 MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)"
 MASTER_PORT="${MASTER_PORT:-$((20000 + SLURM_JOB_ID % 20000))}"
 export MASTER_ADDR MASTER_PORT
-for root in "$HFCONVERTER_ROOT" "$MEGATRON_ROOT" "$BRIDGE_ROOT"; do
+for root in "${source_roots[@]}"; do
     echo "Source: $root commit=$(git -C "$root" rev-parse HEAD)"
 done
 
 # Slurm provides one process per GPU. Do not nest torchrun in this step.
-srun --mpi=pmix --network=disable_rdzv_get --gpu-bind=none --kill-on-bad-exit=1 \
+srun "${step_args[@]}" --mpi=pmix --network=disable_rdzv_get --gpu-bind=none --kill-on-bad-exit=1 \
     --environment="$RUN_ENV" \
     --container-mounts="${SCRATCH}:${SCRATCH},${HOME}:${HOME},/capstor:/capstor,/iopsstor:/iopsstor,/ritom:/ritom" \
     -l -u bash -c '
@@ -53,8 +66,16 @@ srun --mpi=pmix --network=disable_rdzv_get --gpu-bind=none --kill-on-bad-exit=1 
         export RANK="$SLURM_PROCID"
         export LOCAL_RANK="$SLURM_LOCALID"
         export WORLD_SIZE="$SLURM_NTASKS"
-        export PYTHONPATH="$MEGATRON_ROOT:$BRIDGE_ROOT/src:$BRIDGE_ROOT/scripts/conversion${PYTHONPATH:+:$PYTHONPATH}"
+        if [[ "$1" == quantize ]]; then
+            export PYTHONPATH="$HFCONVERTER_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+        else
+            export PYTHONPATH="$MEGATRON_ROOT:$BRIDGE_ROOT/src:$BRIDGE_ROOT/scripts/conversion${PYTHONPATH:+:$PYTHONPATH}"
+        fi
         unset VIRTUAL_ENV UV_PYTHON PYTHONHOME
+        python_args=()
+        if [[ "$1" == quantize ]]; then
+            python_args=(--python /usr/bin/python3.12)
+        fi
         export PYTHONNOUSERSITE=1
         export PYTHONDONTWRITEBYTECODE=1
         if [[ "$1" == import && ! -d "$2" ]]; then
@@ -85,8 +106,8 @@ srun --mpi=pmix --network=disable_rdzv_get --gpu-bind=none --kill-on-bad-exit=1 
         if [[ -n "${CPU_MEMORY_NODES:-}" ]]; then
             command -v numactl >/dev/null || { echo "CPU_MEMORY_NODES requires numactl" >&2; exit 2; }
             exec numactl --cpunodebind="$LOCAL_RANK" --membind="$CPU_MEMORY_NODES" \
-                uv run --no-project python "$CONVERTER_SCRIPT" "$@"
+                uv run --no-project "${python_args[@]}" python "$CONVERTER_SCRIPT" "$@"
         fi
-        exec uv run --no-project python \
+        exec uv run --no-project "${python_args[@]}" python \
             "$CONVERTER_SCRIPT" "$@"
     ' bridge-convert "$@"

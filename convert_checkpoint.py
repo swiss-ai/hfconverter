@@ -54,6 +54,49 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-hf-keys", type=Path, help="JSON list of expected HF keys"
     )
 
+    quantize_parser = commands.add_parser(
+        "quantize", help="Write an HF checkpoint with FP8 routed-expert weights"
+    )
+    quantize_parser.add_argument(
+        "reference",
+        type=Path,
+        help="Local BF16/FP16/FP32 HF safetensors directory",
+    )
+    quantize_parser.add_argument(
+        "output",
+        type=Path,
+        help="New HF output directory (must not exist)",
+    )
+    quantize_parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        metavar="TARGET",
+        help="Also quantize this module name or re:REGEX (repeatable); "
+        "default is routed experts only",
+    )
+    quantize_parser.add_argument(
+        "--ignore",
+        action="append",
+        default=[],
+        metavar="TARGET",
+        help="Exclude this module name or re:REGEX (repeatable); "
+        "exclusions take priority",
+    )
+    quantize_parser.add_argument(
+        "--device",
+        action="append",
+        metavar="DEVICE",
+        help="Quantization device, e.g. cpu or cuda:0 (repeatable); "
+        "default is available accelerators",
+    )
+    quantize_parser.add_argument(
+        "--max-workers",
+        type=_positive_int,
+        default=1,
+        help="Concurrent shard workers (default: 1 to limit host memory)",
+    )
+
     import_parser = commands.add_parser("import", help="Import HF weights to Megatron")
     import_parser.add_argument(
         "reference", help="Local HF model directory or Hugging Face model ID"
@@ -506,9 +549,25 @@ def _save_bounded_stream(
 
 
 def run(args: argparse.Namespace, *, expected_keys_fn: Any = None) -> None:
+    if args.direction == "quantize":
+        if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+            raise ValueError("HF quantization requires one process; do not use torchrun")
+        from quantize_hf import quantize_checkpoint
+
+        quantize_checkpoint(
+            args.reference,
+            args.output,
+            include=args.include,
+            ignore=args.ignore,
+            device=args.device,
+            max_workers=args.max_workers,
+        )
+        return
+
     if args.direction == "import":
         _run_import(args)
         return
+
     source_kind = _validate_paths(
         args.checkpoint,
         args.reference,

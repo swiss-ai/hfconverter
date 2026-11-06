@@ -215,6 +215,66 @@ then `import --help` or `export --help`.
 **Credit:** [Yixuan Xu (@Alvorecer721)](https://github.com/Alvorecer721)
 for the idea to use Megatron Bridge for conversion.
 
+## FP8 checkpoint quantization
+
+Quantize an existing HF safetensors checkpoint with llm-compressor's
+[`model_free_ptq`](https://docs.vllm.ai/projects/llm-compressor/en/latest/guides/entrypoints/model-free-ptq/).
+The default targets are **routed expert gate/up/down projections only**, using
+`FP8_BLOCK`: E4M3 weights, 128×128 weight blocks and dynamic FP8 activations.
+Shared experts, attention, routers, latent projections and other tensors stay
+unchanged. This supports Apertus2's per-expert HF projection layout; it does not
+require a Transformers model implementation, Bridge/Core roots or calibration data.
+The library writes vLLM's supported **compressed-tensors** checkpoint format,
+including the weight scales, updated index and quantization metadata.
+
+The optional packages can be installed into scratch without replacing the
+packages in the tested `nemo.toml` image:
+
+```bash
+QUANT_DEPS="$SCRATCH/tmp/hf-quantization-deps"
+uv pip install --target "$QUANT_DEPS" --no-deps -r requirements-quantization.txt
+export PYTHONPATH="$QUANT_DEPS${PYTHONPATH:+:$PYTHONPATH}"
+
+# Check the available partitions before submission.
+sinfo -a -o "%P %a"
+
+# One task, using the repository's nemo.toml by default. No Bridge roots needed.
+sbatch --nodes=1 --ntasks=1 --ntasks-per-node=1 convert_bridge.sbatch \
+  quantize /path/to/bf16-hf /new/path/to/fp8-hf
+
+# Inside an already selected container:
+uv run --no-project --python /usr/bin/python3.12 python convert_checkpoint.py quantize \
+  /path/to/bf16-hf /new/path/to/fp8-hf
+```
+
+Use repeatable `--include` options to add module names or library `re:` patterns.
+`--ignore` exclusions take priority over all targets. Select complete fused
+projection groups (for example, all Q/K/V projections), and keep each routed
+expert layer uniformly quantized or unquantized. Partial groups are rejected
+before writing output. For example:
+
+```bash
+uv run --no-project --python /usr/bin/python3.12 python convert_checkpoint.py quantize \
+  "$HF_SOURCE" "$HF_FP8" \
+  --include 're:.*\.shared_experts\..*' \
+  --include 're:.*\.self_attn\..*' \
+  --ignore 're:.*\.gate$'
+```
+
+`--device cpu` selects CPU quantization. Repeat `--device cuda:0 --device cuda:1`
+to select GPUs; otherwise the library detects available accelerators. Shards are
+processed without loading the full model. `--max-workers` defaults to **1** to
+limit host memory; increase it explicitly for concurrent shard processing.
+Memory use scales with a shard and its quantization working buffers.
+
+The output directory must not exist and must not overlap the input. Input
+symlinks and already quantized checkpoints are rejected. Success writes
+`QUANTIZATION_COMPLETE` last. Failure or cancellation can leave a partial output;
+there is no automatic resume or overwrite. Inspect it and select a fresh output
+for a retry. The source checkpoint is never rewritten. FP8 quantization changes
+expert values; it does not claim BF16-exact logits. Existing import/export and
+unquantized model profiles are unchanged.
+
 ## Run the tests
 
 ```bash
